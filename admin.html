@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Neev Seeds — Distributor Manager</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --green:   #1B5E20;
+    --green2:  #2E7D32;
+    --green3:  #43A047;
+    --lime:    #8BC34A;
+    --cream:   #F9F6EF;
+    --sand:    #EDE8DF;
+    --text:    #1A1A1A;
+    --muted:   #6B6B6B;
+    --red:     #C62828;
+    --border:  #D4CFC6;
+    --shadow:  0 2px 16px rgba(27,94,32,.10);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'DM Sans', sans-serif; background: var(--cream); color: var(--text); min-height: 100vh; }
+
+  /* ── HEADER ── */
+  header {
+    background: var(--green);
+    color: #fff;
+    padding: 0 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 64px;
+    box-shadow: 0 2px 12px rgba(0,0,0,.18);
+    position: sticky; top: 0; z-index: 100;
+  }
+  .logo { font-family: 'DM Serif Display', serif; font-size: 22px; letter-spacing: .5px; }
+  .logo span { color: var(--lime); }
+  .badge { background: rgba(255,255,255,.15); border-radius: 20px; padding: 4px 14px; font-size: 13px; font-weight: 500; }
+
+  /* ── LAYOUT ── */
+  .container { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+
+  /* ── TOOLBAR ── */
+  .toolbar { display: flex; gap: 12px; margin-bottom: 24px; align-items: center; flex-wrap: wrap; }
+  .search-wrap { flex: 1; min-width: 240px; position: relative; }
+  .search-wrap input {
+    width: 100%; padding: 10px 16px 10px 40px;
+    border: 1.5px solid var(--border); border-radius: 10px;
+    font-family: inherit; font-size: 14px; background: #fff;
+    transition: border .2s;
+  }
+  .search-wrap input:focus { outline: none; border-color: var(--green3); }
+  .search-icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 16px; pointer-events: none; }
+  .btn {
+    padding: 10px 20px; border-radius: 10px; border: none;
+    font-family: inherit; font-size: 14px; font-weight: 600;
+    cursor: pointer; transition: all .15s; display: inline-flex; align-items: center; gap: 6px;
+  }
+  .btn-primary { background: var(--green); color: #fff; }
+  .btn-primary:hover { background: var(--green2); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(27,94,32,.25); }
+  .btn-danger  { background: var(--red); color: #fff; }
+  .btn-danger:hover  { opacity: .88; }
+  .btn-ghost  { background: var(--sand); color: var(--text); border: 1.5px solid var(--border); }
+  .btn-ghost:hover  { background: var(--border); }
+  .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 7px; }
+
+  /* ── STATS ROW ── */
+  .stats { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+  .stat { background: #fff; border-radius: 12px; padding: 16px 20px; flex: 1; min-width: 140px; box-shadow: var(--shadow); border: 1px solid var(--border); }
+  .stat-val { font-family: 'DM Serif Display', serif; font-size: 32px; color: var(--green); line-height: 1; }
+  .stat-label { font-size: 12px; color: var(--muted); margin-top: 4px; font-weight: 500; text-transform: uppercase; letter-spacing: .5px; }
+
+  /* ── TABLE ── */
+  .table-wrap { background: #fff; border-radius: 14px; box-shadow: var(--shadow); border: 1px solid var(--border); overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    background: var(--green); color: #fff;
+    padding: 13px 16px; text-align: left;
+    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .6px;
+  }
+  tbody tr { border-bottom: 1px solid var(--sand); transition: background .1s; }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: var(--cream); }
+  td { padding: 13px 16px; font-size: 13.5px; vertical-align: middle; }
+  td.name { font-weight: 600; max-width: 220px; }
+  td.addr { color: var(--muted); font-size: 12.5px; max-width: 260px; }
+  .pin-badge { background: var(--sand); color: var(--green); border-radius: 6px; padding: 3px 8px; font-size: 12px; font-weight: 600; font-family: monospace; }
+  .mob { font-size: 12.5px; color: var(--muted); }
+  .actions { display: flex; gap: 6px; white-space: nowrap; }
+
+  /* ── EMPTY ── */
+  .empty { text-align: center; padding: 60px 20px; color: var(--muted); }
+  .empty-icon { font-size: 48px; margin-bottom: 12px; }
+
+  /* ── MODAL ── */
+  .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 200; align-items: center; justify-content: center; }
+  .overlay.open { display: flex; animation: fadeIn .15s; }
+  @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+  .modal {
+    background: #fff; border-radius: 16px; width: 100%; max-width: 480px;
+    padding: 32px; box-shadow: 0 20px 60px rgba(0,0,0,.2);
+    animation: slideUp .2s ease-out;
+  }
+  @keyframes slideUp { from { transform: translateY(24px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+  .modal h2 { font-family: 'DM Serif Display', serif; font-size: 22px; margin-bottom: 24px; color: var(--green); }
+  .form-group { margin-bottom: 18px; }
+  label { display: block; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin-bottom: 6px; }
+  input, textarea {
+    width: 100%; padding: 10px 14px; border: 1.5px solid var(--border); border-radius: 9px;
+    font-family: inherit; font-size: 14px; background: #fff; transition: border .2s;
+  }
+  input:focus, textarea:focus { outline: none; border-color: var(--green3); }
+  textarea { resize: vertical; min-height: 80px; }
+  .modal-footer { display: flex; gap: 10px; justify-content: flex-end; margin-top: 24px; }
+  .err-msg { color: var(--red); font-size: 13px; margin-top: 8px; display: none; }
+
+  /* ── TOAST ── */
+  #toast {
+    position: fixed; bottom: 28px; right: 28px; z-index: 999;
+    background: var(--green); color: #fff; padding: 12px 22px;
+    border-radius: 10px; font-size: 14px; font-weight: 500;
+    box-shadow: 0 4px 20px rgba(0,0,0,.2);
+    transform: translateY(80px); opacity: 0; transition: all .3s;
+  }
+  #toast.show { transform: translateY(0); opacity: 1; }
+  #toast.err   { background: var(--red); }
+
+  /* ── CONFIRM ── */
+  .confirm-modal { max-width: 360px; text-align: center; }
+  .confirm-modal p { color: var(--muted); margin-bottom: 24px; font-size: 14px; line-height: 1.6; }
+
+  /* ── KEY INPUT ── */
+  #key-screen { display: flex; align-items: center; justify-content: center; min-height: 100vh; background: var(--cream); }
+  .key-card { background: #fff; border-radius: 16px; padding: 48px 40px; box-shadow: var(--shadow); width: 100%; max-width: 380px; text-align: center; border: 1px solid var(--border); }
+  .key-card h1 { font-family: 'DM Serif Display', serif; color: var(--green); font-size: 26px; margin-bottom: 6px; }
+  .key-card p { color: var(--muted); font-size: 14px; margin-bottom: 28px; }
+  .key-card input { text-align: center; font-size: 16px; letter-spacing: 2px; }
+  .key-err { color: var(--red); font-size: 13px; margin-top: 10px; min-height: 20px; }
+
+  @media (max-width: 640px) {
+    .toolbar { flex-direction: column; align-items: stretch; }
+    .search-wrap { min-width: 0; }
+    td.addr { display: none; }
+    header { padding: 0 16px; }
+    .container { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- KEY SCREEN -->
+<div id="key-screen">
+  <div class="key-card">
+    <div style="font-size:48px;margin-bottom:12px">🌾</div>
+    <h1>Neev Seeds</h1>
+    <p>Distributor Management Portal</p>
+    <div class="form-group">
+      <input type="password" id="key-input" placeholder="Enter admin key" onkeydown="if(event.key==='Enter')login()">
+    </div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="login()">Login →</button>
+    <div class="key-err" id="key-err"></div>
+  </div>
+</div>
+
+<!-- MAIN APP (hidden until login) -->
+<div id="app" style="display:none">
+  <header>
+    <div class="logo">Neev <span>Seeds</span> · Distributor Manager</div>
+    <div style="display:flex;align-items:center;gap:12px">
+      <span class="badge" id="total-badge">— distributors</span>
+      <button class="btn btn-ghost btn-sm" onclick="logout()" style="color:#fff;background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.25)">Logout</button>
+    </div>
+  </header>
+
+  <div class="container">
+    <!-- Stats -->
+    <div class="stats">
+      <div class="stat"><div class="stat-val" id="stat-total">—</div><div class="stat-label">Total Distributors</div></div>
+      <div class="stat"><div class="stat-val" id="stat-states">—</div><div class="stat-label">States Covered</div></div>
+      <div class="stat"><div class="stat-val" id="stat-filtered">—</div><div class="stat-label">Showing</div></div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="toolbar">
+      <div class="search-wrap">
+        <span class="search-icon">🔍</span>
+        <input type="text" id="search-input" placeholder="Search by name, pincode, city…" oninput="handleSearch(this.value)">
+      </div>
+      <button class="btn btn-primary" onclick="openAdd()">+ Add Distributor</button>
+    </div>
+
+    <!-- Table -->
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Distributor Name</th>
+            <th>Pincode</th>
+            <th>Mobile</th>
+            <th>Address</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="table-body">
+          <tr><td colspan="6"><div class="empty"><div class="empty-icon">⏳</div>Loading…</div></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ADD / EDIT MODAL -->
+<div class="overlay" id="form-overlay" onclick="if(event.target===this)closeForm()">
+  <div class="modal">
+    <h2 id="form-title">Add Distributor</h2>
+    <div class="form-group">
+      <label>Distributor Name *</label>
+      <input type="text" id="f-name" placeholder="e.g. Rathi Khad Bhandar (Sampla)">
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+      <div class="form-group">
+        <label>Pincode *</label>
+        <input type="text" id="f-pin" placeholder="152116" maxlength="6" oninput="this.value=this.value.replace(/\D/g,'')">
+      </div>
+      <div class="form-group">
+        <label>Mobile *</label>
+        <input type="text" id="f-mob" placeholder="9876543210">
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Address *</label>
+      <textarea id="f-addr" placeholder="Shop/village, City, District (State)"></textarea>
+    </div>
+    <div class="err-msg" id="form-err"></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeForm()">Cancel</button>
+      <button class="btn btn-primary" id="form-submit" onclick="submitForm()">Save Distributor</button>
+    </div>
+  </div>
+</div>
+
+<!-- DELETE CONFIRM MODAL -->
+<div class="overlay" id="del-overlay">
+  <div class="modal confirm-modal">
+    <div style="font-size:44px;margin-bottom:12px">🗑️</div>
+    <h2 style="font-size:18px;margin-bottom:8px">Delete Distributor?</h2>
+    <p id="del-name-text">This will permanently remove this distributor from the bot.</p>
+    <div class="modal-footer" style="justify-content:center">
+      <button class="btn btn-ghost" onclick="closeDelete()">Cancel</button>
+      <button class="btn btn-danger" onclick="confirmDelete()">Yes, Delete</button>
+    </div>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div id="toast"></div>
+
+<script>
+const API = window.location.origin;
+let adminKey = '';
+let allRows  = [];
+let editId   = null;
+let deleteId = null;
+
+// ── AUTH ──────────────────────────────────────────────────────────────────────
+async function login() {
+  const k = document.getElementById('key-input').value.trim();
+  if (!k) return;
+  const res = await fetch(API+'/admin/distributors?limit=1', {headers:{'X-Admin-Key':k}});
+  if (res.ok) {
+    adminKey = k;
+    document.getElementById('key-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    loadAll();
+  } else {
+    document.getElementById('key-err').textContent = 'Invalid key. Try again.';
+  }
+}
+function logout() {
+  adminKey = ''; allRows = [];
+  document.getElementById('key-screen').style.display = 'flex';
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('key-input').value = '';
+}
+
+// ── DATA ──────────────────────────────────────────────────────────────────────
+async function loadAll(query='') {
+  const url = API+'/admin/distributors'+(query?'?q='+encodeURIComponent(query):'');
+  const res = await fetch(url, {headers:{'X-Admin-Key':adminKey}});
+  allRows   = await res.json();
+  renderTable(allRows);
+  updateStats(allRows);
+}
+
+function updateStats(rows) {
+  document.getElementById('stat-total').textContent    = allRows.length;
+  document.getElementById('stat-filtered').textContent = rows.length;
+  document.getElementById('total-badge').textContent   = allRows.length+' distributors';
+  // Count unique state mentions
+  const states = new Set();
+  allRows.forEach(r => { const m = r.address.match(/\(([^)]+)\)\s*$/); if(m) states.add(m[1].split(',')[0].trim()); });
+  document.getElementById('stat-states').textContent = states.size || '—';
+}
+
+function renderTable(rows) {
+  const tb = document.getElementById('table-body');
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="6"><div class="empty"><div class="empty-icon">🔍</div>No distributors found</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map((r,i) => `
+    <tr>
+      <td style="color:var(--muted);font-size:12px">${r.id}</td>
+      <td class="name">${esc(r.name)}</td>
+      <td><span class="pin-badge">${esc(r.pincode)}</span></td>
+      <td class="mob">${esc(r.mobile)}</td>
+      <td class="addr">${esc(r.address)}</td>
+      <td>
+        <div class="actions">
+          <button class="btn btn-ghost btn-sm" onclick="openEdit(${r.id})">✏️ Edit</button>
+          <button class="btn btn-danger btn-sm" onclick="openDelete(${r.id},'${esc(r.name).replace(/'/g,"\\'")}')">🗑️</button>
+        </div>
+      </td>
+    </tr>`).join('');
+}
+
+let searchTimer;
+function handleSearch(val) {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => loadAll(val), 320);
+}
+
+// ── FORM ──────────────────────────────────────────────────────────────────────
+function openAdd() {
+  editId = null;
+  document.getElementById('form-title').textContent = 'Add Distributor';
+  document.getElementById('form-submit').textContent = 'Save Distributor';
+  ['f-name','f-pin','f-mob','f-addr'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('form-err').style.display = 'none';
+  document.getElementById('form-overlay').classList.add('open');
+  document.getElementById('f-name').focus();
+}
+
+async function openEdit(id) {
+  editId = id;
+  const res = await fetch(API+'/admin/distributors/'+id, {headers:{'X-Admin-Key':adminKey}});
+  const r   = await res.json();
+  document.getElementById('form-title').textContent   = 'Edit Distributor';
+  document.getElementById('form-submit').textContent  = 'Update Distributor';
+  document.getElementById('f-name').value  = r.name;
+  document.getElementById('f-pin').value   = r.pincode;
+  document.getElementById('f-mob').value   = r.mobile;
+  document.getElementById('f-addr').value  = r.address;
+  document.getElementById('form-err').style.display = 'none';
+  document.getElementById('form-overlay').classList.add('open');
+}
+
+function closeForm() { document.getElementById('form-overlay').classList.remove('open'); }
+
+async function submitForm() {
+  const name    = document.getElementById('f-name').value.trim();
+  const pincode = document.getElementById('f-pin').value.trim();
+  const mobile  = document.getElementById('f-mob').value.trim();
+  const address = document.getElementById('f-addr').value.trim();
+  const errEl   = document.getElementById('form-err');
+
+  if (!name || !pincode || !mobile || !address) {
+    errEl.textContent = 'All fields are required.'; errEl.style.display = 'block'; return;
+  }
+  if (!/^\d{6}$/.test(pincode)) {
+    errEl.textContent = 'Pincode must be exactly 6 digits.'; errEl.style.display = 'block'; return;
+  }
+
+  const method = editId ? 'PUT' : 'POST';
+  const url    = editId ? API+'/admin/distributors/'+editId : API+'/admin/distributors';
+  const res    = await fetch(url, {
+    method, headers: {'Content-Type':'application/json','X-Admin-Key':adminKey},
+    body: JSON.stringify({name,pincode,mobile,address})
+  });
+  if (res.ok) {
+    closeForm(); loadAll();
+    toast(editId ? 'Distributor updated ✓' : 'Distributor added ✓');
+  } else {
+    const e = await res.json();
+    errEl.textContent = e.error || 'Something went wrong.'; errEl.style.display = 'block';
+  }
+}
+
+// ── DELETE ────────────────────────────────────────────────────────────────────
+function openDelete(id, name) {
+  deleteId = id;
+  document.getElementById('del-name-text').textContent = '"'+name+'" will be permanently removed from the bot.';
+  document.getElementById('del-overlay').classList.add('open');
+}
+function closeDelete() { document.getElementById('del-overlay').classList.remove('open'); deleteId = null; }
+
+async function confirmDelete() {
+  const res = await fetch(API+'/admin/distributors/'+deleteId, {
+    method:'DELETE', headers:{'X-Admin-Key':adminKey}
+  });
+  closeDelete();
+  if (res.ok) { loadAll(); toast('Distributor deleted', true); }
+  else toast('Delete failed', true);
+}
+
+// ── TOAST ─────────────────────────────────────────────────────────────────────
+function toast(msg, isErr=false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className   = 'show' + (isErr ? ' err' : '');
+  setTimeout(() => t.className = '', 3000);
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>
