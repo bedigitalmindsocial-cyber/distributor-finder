@@ -12,17 +12,17 @@ ADMIN_KEY    = os.environ.get("ADMIN_KEY", "neev2024admin")
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
 def parse_db_url(url):
-    """Parse postgresql://user:pass@host:port/dbname"""
-    import re
     m = re.match(r"postgresql://([^:]+):([^@]+)@([^:/]+):?(\d+)?/(.+)", url)
-    if not m: raise ValueError("Invalid DATABASE_URL: " + url)
+    if not m: raise ValueError("Bad DATABASE_URL")
     return dict(user=m[1], password=m[2], host=m[3],
                 port=int(m[4] or 5432), database=m[5])
 
 def get_db():
     if "db" not in g:
-        params = parse_db_url(DATABASE_URL)
-        g.db = pg8000.native.Connection(**params, ssl_context=True)
+        p = parse_db_url(DATABASE_URL)
+        g.db = pg8000.native.Connection(
+            p["user"], host=p["host"], port=p["port"],
+            database=p["database"], password=p["password"], ssl_context=True)
     return g.db
 
 @app.teardown_appcontext
@@ -32,57 +32,57 @@ def close_db(e=None):
         try: db.close()
         except: pass
 
-def query(sql, args=()):
-    db  = get_db()
-    res = db.run(sql, *args) if args else db.run(sql)
+def query(sql, **kw):
+    db   = get_db()
+    rows = db.run(sql, **kw)
     cols = [c["name"] for c in db.columns]
-    return [dict(zip(cols, row)) for row in res]
+    return [dict(zip(cols, r)) for r in rows]
 
-def query_one(sql, args=()):
-    rows = query(sql, args)
+def query_one(sql, **kw):
+    rows = query(sql, **kw)
     return rows[0] if rows else None
 
-def mutate(sql, args=()):
+def mutate(sql, **kw):
     db = get_db()
-    db.run(sql, *args) if args else db.run(sql)
+    db.run(sql, **kw)
 
-def mutate_returning(sql, args=()):
-    db  = get_db()
-    res = db.run(sql, *args) if args else db.run(sql)
-    return res[0][0] if res else None
+def mutate_returning(sql, **kw):
+    db   = get_db()
+    rows = db.run(sql, **kw)
+    return rows[0][0] if rows else None
 
 def init_db():
-    params = parse_db_url(DATABASE_URL)
-    db = pg8000.native.Connection(**params, ssl_context=True)
-    db.run("""
-        CREATE TABLE IF NOT EXISTS distributors (
+    try:
+        p  = parse_db_url(DATABASE_URL)
+        db = pg8000.native.Connection(
+            p["user"], host=p["host"], port=p["port"],
+            database=p["database"], password=p["password"], ssl_context=True)
+        db.run("""CREATE TABLE IF NOT EXISTS distributors (
             id      SERIAL PRIMARY KEY,
             name    TEXT NOT NULL,
             pincode TEXT NOT NULL,
             mobile  TEXT NOT NULL,
-            address TEXT NOT NULL
-        )
-    """)
-    count = db.run("SELECT COUNT(*) FROM distributors")[0][0]
-    if count == 0:
-        logging.info("Empty DB — seeding distributors...")
-        for d in SEED_DATA:
-            db.run(
-                "INSERT INTO distributors (name,pincode,mobile,address) VALUES (:1,:2,:3,:4)",
-                d["name"], d["pincode"], d["mobile"], d["address"]
-            )
-        logging.info("Seed complete: %d records", len(SEED_DATA))
-    else:
-        logging.info("DB has %d records — skipping seed.", count)
-    db.close()
+            address TEXT NOT NULL)""")
+        count = db.run("SELECT COUNT(*) FROM distributors")[0][0]
+        if count == 0:
+            logging.info("Seeding %d distributors...", len(SEED_DATA))
+            for d in SEED_DATA:
+                db.run("INSERT INTO distributors (name,pincode,mobile,address) VALUES (:name,:pin,:mob,:addr)",
+                       name=d["name"], pin=d["pincode"], mob=d["mobile"], addr=d["address"])
+            logging.info("Seed done.")
+        else:
+            logging.info("DB has %d records.", count)
+        db.close()
+    except Exception as e:
+        logging.error("init_db failed: %s", e)
 
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 def require_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        key = request.headers.get("X-Admin-Key") or request.args.get("key")
+        key = request.headers.get("X-Admin-Key") or request.args.get("key","")
         if key != ADMIN_KEY:
-            return jsonify({"error": "Unauthorized"}), 401
+            return jsonify({"error":"Unauthorized"}), 401
         return f(*args, **kwargs)
     return decorated
 
@@ -103,39 +103,34 @@ def wx_label(code):
     return "🌡️ मौसम"
 
 def pincode_to_latlon(pincode):
-    url = ("https://nominatim.openstreetmap.org/search"
-           "?postalcode="+pincode+"&country=India&format=json&limit=1")
-    req = urllib.request.Request(url, headers={"User-Agent":"NeevSeeds-WeatherBot/1.0"})
+    url = "https://nominatim.openstreetmap.org/search?postalcode="+pincode+"&country=India&format=json&limit=1"
+    req = urllib.request.Request(url, headers={"User-Agent":"NeevSeeds/1.0"})
     with urllib.request.urlopen(req, timeout=10) as r:
         data = json.loads(r.read())
     if not data: return None, None, None
     return float(data[0]["lat"]), float(data[0]["lon"]), data[0].get("display_name","")
 
 def get_forecast(lat, lon):
-    url = ("https://api.open-meteo.com/v1/forecast"
-           "?latitude="+str(lat)+"&longitude="+str(lon)+
-           "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
-           "precipitation_sum,precipitation_probability_max,wind_speed_10m_max"
-           "&timezone=Asia/Kolkata&forecast_days=7")
+    url = ("https://api.open-meteo.com/v1/forecast?latitude="+str(lat)+"&longitude="+str(lon)+
+           "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,"
+           "precipitation_probability_max,wind_speed_10m_max&timezone=Asia/Kolkata&forecast_days=7")
     with urllib.request.urlopen(url, timeout=10) as r:
         return json.loads(r.read())["daily"]
 
-def format_weather_msg(pincode, daily, location_name):
-    parts = [p.strip() for p in location_name.split(",")]
+def format_weather_msg(pincode, daily, loc):
+    parts = [p.strip() for p in loc.split(",")]
     city  = parts[1] if len(parts) > 1 else parts[0]
     lines = ["*"+city+" - 7 दिन का मौसम* (पिन: "+pincode+")\n"]
     for i in range(7):
-        d        = datetime.strptime(daily["time"][i], "%Y-%m-%d")
-        rain_mm  = daily["precipitation_sum"][i] or 0
-        rain_pct = daily["precipitation_probability_max"][i] or 0
-        wind     = daily["wind_speed_10m_max"][i]
-        line     = ("*"+DAYS_HI[d.weekday()]+" ("+d.strftime("%d %b")+")*\n"
-                    +wx_label(daily["weather_code"][i])+"\n"
-                    +"🌡 "+str(daily["temperature_2m_min"][i])
-                    +"°C – "+str(daily["temperature_2m_max"][i])+"°C")
-        if rain_mm > 0:     line += "\n🌧 बारिश: "+str(rain_mm)+"mm ("+str(rain_pct)+"%)"
-        elif rain_pct > 20: line += "\n🌧 बारिश संभव: "+str(rain_pct)+"%"
-        line += "\n💨 हवा: "+str(wind)+" km/h"
+        d = datetime.strptime(daily["time"][i], "%Y-%m-%d")
+        rm = daily["precipitation_sum"][i] or 0
+        rp = daily["precipitation_probability_max"][i] or 0
+        line = ("*"+DAYS_HI[d.weekday()]+" ("+d.strftime("%d %b")+")*\n"
+                +wx_label(daily["weather_code"][i])+"\n"
+                +"🌡 "+str(daily["temperature_2m_min"][i])+"°C – "+str(daily["temperature_2m_max"][i])+"°C")
+        if rm > 0:    line += "\n🌧 बारिश: "+str(rm)+"mm ("+str(rp)+"%)"
+        elif rp > 20: line += "\n🌧 बारिश संभव: "+str(rp)+"%"
+        line += "\n💨 हवा: "+str(daily["wind_speed_10m_max"][i])+" km/h"
         lines.append(line)
         if i < 6: lines.append("—")
     lines.append("\n_स्रोत: Open-Meteo_")
@@ -144,49 +139,43 @@ def format_weather_msg(pincode, daily, location_name):
 # ── DISTRIBUTOR ────────────────────────────────────────────────────────────────
 def find_nearest(pincode_str):
     pin_int = int(pincode_str)
-    rows = query("SELECT * FROM distributors WHERE pincode = :1", (pincode_str,))
+    rows = query("SELECT * FROM distributors WHERE pincode = :p", p=pincode_str)
     if rows: return rows[:5], "exact"
-    rows = query("SELECT * FROM distributors WHERE pincode LIKE :1", (pincode_str[:4]+"%",))
+    rows = query("SELECT * FROM distributors WHERE pincode LIKE :p", p=pincode_str[:4]+"%")
     if rows:
-        rows = sorted(rows, key=lambda r: abs(int(r["pincode"]) - pin_int))
-        return rows[:5], "nearby"
-    rows = query("SELECT * FROM distributors WHERE pincode LIKE :1", (pincode_str[:3]+"%",))
+        return sorted(rows, key=lambda r: abs(int(r["pincode"])-pin_int))[:5], "nearby"
+    rows = query("SELECT * FROM distributors WHERE pincode LIKE :p", p=pincode_str[:3]+"%")
     if rows:
-        rows = sorted(rows, key=lambda r: abs(int(r["pincode"]) - pin_int))
-        return rows[:5], "district"
+        return sorted(rows, key=lambda r: abs(int(r["pincode"])-pin_int))[:5], "district"
     return [], None
 
 def format_dist_msg(matches, level):
     labels = {"exact":"आपके क्षेत्र के","nearby":"आपके नजदीक के","district":"आपके जिले के"}
     lines  = ["✅ "+labels.get(level,"नजदीकी")+" *Neev Seeds* के "+str(len(matches))+" डिस्ट्रीब्यूटर:\n"]
     for i, d in enumerate(matches, 1):
-        lines.append("*"+str(i)+". "+d["name"]+"*")
-        lines.append("📍 "+d["address"])
-        lines.append("📞 "+d["mobile"])
-        lines.append("")
+        lines += ["*"+str(i)+". "+d["name"]+"*", "📍 "+d["address"], "📞 "+d["mobile"], ""]
     lines.append("किसी भी जानकारी के लिए डिस्ट्रीब्यूटर से सीधे संपर्क करें। 🙏")
     return "\n".join(lines)
 
 def get_pincode():
-    if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        p = str(body.get("pincode","")).strip()
-    else:
-        p = request.args.get("pincode","").strip()
-    p = re.sub(r"\D","", p)
-    return p if len(p) == 6 else None
+    p = (request.get_json(silent=True) or {}).get("pincode","") if request.method=="POST" else request.args.get("pincode","")
+    p = re.sub(r"\D","", str(p))
+    return p if len(p)==6 else None
 
 # ── BOT ROUTES ────────────────────────────────────────────────────────────────
 @app.route("/find", methods=["GET","POST"])
 def find_distributors():
     pincode = get_pincode()
-    logging.info("FIND | pin=%s", pincode)
     if not pincode:
-        return jsonify({"count":0,"message":"कृपया सही 6 अंकों का पिनकोड भेजें।\nजैसे: 152116"}), 400
-    matches, level = find_nearest(pincode)
-    if not matches:
-        return jsonify({"count":0,"message":"पिनकोड "+pincode+" के पास कोई Neev Seeds डिस्ट्रीब्यूटर नहीं मिला।\nNeev Seeds से सीधे संपर्क करें। 🙏"})
-    return jsonify({"count":len(matches),"match_level":level,"message":format_dist_msg(matches,level)})
+        return jsonify({"count":0,"message":"कृपया सही 6 अंकों का पिनकोड भेजें।"}), 400
+    try:
+        matches, level = find_nearest(pincode)
+        if not matches:
+            return jsonify({"count":0,"message":"पिनकोड "+pincode+" के पास कोई डिस्ट्रीब्यूटर नहीं मिला। Neev Seeds से सीधे संपर्क करें। 🙏"})
+        return jsonify({"count":len(matches),"match_level":level,"message":format_dist_msg(matches,level)})
+    except Exception as e:
+        logging.error("find error: %s", e)
+        return jsonify({"count":0,"message":"सेवा अस्थायी रूप से उपलब्ध नहीं। बाद में प्रयास करें।"}), 500
 
 @app.route("/weather", methods=["GET","POST"])
 def weather():
@@ -195,24 +184,32 @@ def weather():
         return jsonify({"message":"कृपया सही 6 अंकों का पिनकोड भेजें।"}), 400
     try:
         lat, lon, loc = pincode_to_latlon(pincode)
-        if not lat: return jsonify({"message":"पिनकोड "+pincode+" की लोकेशन नहीं मिली।"})
-        return jsonify({"pincode":pincode,"location":loc,
-                        "message":format_weather_msg(pincode,get_forecast(lat,lon),loc)})
+        if not lat: return jsonify({"message":"लोकेशन नहीं मिली।"})
+        return jsonify({"pincode":pincode,"location":loc,"message":format_weather_msg(pincode,get_forecast(lat,lon),loc)})
     except Exception as e:
-        logging.error("Weather error: %s", e)
+        logging.error("weather error: %s", e)
         return jsonify({"message":"मौसम जानकारी अभी उपलब्ध नहीं। बाद में प्रयास करें। 🙏"}), 500
 
 # ── ADMIN API ─────────────────────────────────────────────────────────────────
+@app.route("/admin/ping")
+@require_key
+def admin_ping():
+    """Used by UI login to verify key — no DB needed."""
+    return jsonify({"ok": True})
+
 @app.route("/admin/distributors", methods=["GET"])
 @require_key
 def list_distributors():
-    search = request.args.get("q","").strip()
-    if search:
-        s = "%"+search+"%"
-        rows = query("SELECT * FROM distributors WHERE name ILIKE :1 OR pincode ILIKE :2 OR address ILIKE :3 ORDER BY name", (s,s,s))
-    else:
-        rows = query("SELECT * FROM distributors ORDER BY name")
-    return jsonify(rows)
+    try:
+        s = request.args.get("q","").strip()
+        if s:
+            rows = query("SELECT * FROM distributors WHERE name ILIKE :s OR pincode ILIKE :s OR address ILIKE :s ORDER BY name", s="%"+s+"%")
+        else:
+            rows = query("SELECT * FROM distributors ORDER BY name")
+        return jsonify(rows)
+    except Exception as e:
+        logging.error("list error: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/distributors", methods=["POST"])
 @require_key
@@ -226,22 +223,25 @@ def add_distributor():
         return jsonify({"error":"All fields required"}), 400
     if len(pincode) != 6:
         return jsonify({"error":"Pincode must be 6 digits"}), 400
-    rid = mutate_returning(
-        "INSERT INTO distributors (name,pincode,mobile,address) VALUES (:1,:2,:3,:4) RETURNING id",
-        (name, pincode, mobile, address))
-    return jsonify({"id":rid,"message":"Distributor added successfully"}), 201
+    try:
+        rid = mutate_returning(
+            "INSERT INTO distributors (name,pincode,mobile,address) VALUES (:n,:p,:m,:a) RETURNING id",
+            n=name, p=pincode, m=mobile, a=address)
+        return jsonify({"id":rid,"message":"Added successfully"}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/distributors/<int:rid>", methods=["GET"])
 @require_key
 def get_distributor(rid):
-    row = query_one("SELECT * FROM distributors WHERE id = :1", (rid,))
+    row = query_one("SELECT * FROM distributors WHERE id = :id", id=rid)
     if not row: return jsonify({"error":"Not found"}), 404
     return jsonify(row)
 
 @app.route("/admin/distributors/<int:rid>", methods=["PUT"])
 @require_key
 def update_distributor(rid):
-    row = query_one("SELECT * FROM distributors WHERE id = :1", (rid,))
+    row = query_one("SELECT * FROM distributors WHERE id = :id", id=rid)
     if not row: return jsonify({"error":"Not found"}), 404
     data    = request.get_json(silent=True) or {}
     name    = data.get("name", row["name"]).strip()
@@ -250,17 +250,20 @@ def update_distributor(rid):
     address = data.get("address", row["address"]).strip()
     if len(pincode) != 6:
         return jsonify({"error":"Pincode must be 6 digits"}), 400
-    mutate("UPDATE distributors SET name=:1,pincode=:2,mobile=:3,address=:4 WHERE id=:5",
-           (name, pincode, mobile, address, rid))
-    return jsonify({"message":"Updated successfully"})
+    try:
+        mutate("UPDATE distributors SET name=:n,pincode=:p,mobile=:m,address=:a WHERE id=:id",
+               n=name, p=pincode, m=mobile, a=address, id=rid)
+        return jsonify({"message":"Updated"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/distributors/<int:rid>", methods=["DELETE"])
 @require_key
 def delete_distributor(rid):
-    row = query_one("SELECT * FROM distributors WHERE id = :1", (rid,))
+    row = query_one("SELECT * FROM distributors WHERE id = :id", id=rid)
     if not row: return jsonify({"error":"Not found"}), 404
-    mutate("DELETE FROM distributors WHERE id = :1", (rid,))
-    return jsonify({"message":"Deleted successfully"})
+    mutate("DELETE FROM distributors WHERE id = :id", id=rid)
+    return jsonify({"message":"Deleted"})
 
 @app.route("/admin")
 def admin_ui():
@@ -274,7 +277,7 @@ def health():
         count = query_one("SELECT COUNT(*) as c FROM distributors")["c"]
         return jsonify({"status":"ok","distributors":count})
     except Exception as e:
-        return jsonify({"status":"error","message":str(e)}), 500
+        return jsonify({"status":"db_error","message":str(e)}), 500
 
 @app.route("/")
 def home():

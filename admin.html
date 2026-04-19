@@ -268,14 +268,21 @@ let deleteId = null;
 async function login() {
   const k = document.getElementById('key-input').value.trim();
   if (!k) return;
-  const res = await fetch(API+'/admin/distributors?limit=1', {headers:{'X-Admin-Key':k}});
-  if (res.ok) {
-    adminKey = k;
-    document.getElementById('key-screen').style.display = 'none';
-    document.getElementById('app').style.display = 'block';
-    loadAll();
-  } else {
-    document.getElementById('key-err').textContent = 'Invalid key. Try again.';
+  document.getElementById('key-err').textContent = 'Checking...';
+  try {
+    const res = await fetch(API+'/admin/ping', {headers:{'X-Admin-Key':k}});
+    if (res.status === 200) {
+      adminKey = k;
+      document.getElementById('key-screen').style.display = 'none';
+      document.getElementById('app').style.display = 'block';
+      loadAll();
+    } else if (res.status === 401) {
+      document.getElementById('key-err').textContent = 'Invalid key. Try again.';
+    } else {
+      document.getElementById('key-err').textContent = 'Server error '+res.status+'. Check Render logs.';
+    }
+  } catch(e) {
+    document.getElementById('key-err').textContent = 'Cannot reach server. Try again.';
   }
 }
 function logout() {
