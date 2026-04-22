@@ -217,7 +217,19 @@ def find_distributors():
                 "message": ("📍 पिनकोड "+pincode+" के पास अभी कोई Neev Seeds डिस्ट्रीब्यूटर नहीं है।\n\n"
                             "अधिक जानकारी के लिए Neev Seeds से सीधे संपर्क करें। 🙏")
             })
-        return jsonify({"count":len(matches),"match_level":level,"message":format_dist_msg(matches,level)})
+        return jsonify({
+            "count":       len(matches),
+            "match_level": level,
+            "message":     format_dist_msg(matches, level),
+            "distributors": [
+                {
+                    "Distributor Name": d["name"],
+                    "Address":          d["address"],
+                    "Mobile Number":    d["mobile"]
+                }
+                for d in matches
+            ]
+        })
     except Exception as e:
         logging.error("FIND ERROR pin=%s: %s", pincode, e)
         return jsonify({
