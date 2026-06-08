@@ -74,13 +74,34 @@ def auth(f):
 
 def nearest(pin):
     pi=int(pin)
-    r=qry("SELECT * FROM distributors WHERE pincode=%s",(pin,))
-    if r: return r[:5],"exact"
-    r=qry("SELECT * FROM distributors WHERE pincode LIKE %s",(pin[:4]+"%",))
-    if r: return sorted(r,key=lambda x:abs(int(x["pincode"])-pi))[:5],"nearby"
-    r=qry("SELECT * FROM distributors WHERE pincode LIKE %s",(pin[:3]+"%",))
-    if r: return sorted(r,key=lambda x:abs(int(x["pincode"])-pi))[:5],"district"
-    return [],"none"
+    seen=set(); results=[]
+
+    def add(rows,n):
+        rows=sorted(rows,key=lambda r:abs(int(r["pincode"])-pi))
+        for r in rows:
+            if r["name"] not in seen and len(results)<n:
+                seen.add(r["name"]); results.append(r)
+
+    # Tier 1: exact 6-digit
+    add(qry("SELECT * FROM distributors WHERE pincode=%s",(pin,)),5)
+    # Tier 2: first 5 digits
+    if len(results)<5:
+        add(qry("SELECT * FROM distributors WHERE pincode LIKE %s AND pincode!=%s",(pin[:5]+"%",pin)),5)
+    # Tier 3: first 4 digits
+    if len(results)<5:
+        add(qry("SELECT * FROM distributors WHERE pincode LIKE %s",(pin[:4]+"%",)),5)
+    # Tier 4: first 3 digits
+    if len(results)<5:
+        add(qry("SELECT * FROM distributors WHERE pincode LIKE %s",(pin[:3]+"%",)),5)
+
+    if not results: return [],"none"
+    # Label = deepest tier used
+    last=results[-1]["pincode"]
+    if last==pin: lvl="exact"
+    elif last[:5]==pin[:5]: lvl="nearby"
+    elif last[:4]==pin[:4]: lvl="nearby"
+    else: lvl="district"
+    return results[:5],lvl
 
 def fmt(m,lvl):
     L={"exact":"आपके क्षेत्र के","nearby":"आपके नजदीक के","district":"आपके जिले के"}
