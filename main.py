@@ -13,6 +13,11 @@ def add_cors(r):
     r.headers["Access-Control-Allow-Origin"]="*"
     r.headers["Access-Control-Allow-Methods"]="GET,POST,OPTIONS"
     r.headers["Access-Control-Allow-Headers"]="Content-Type,X-Admin-Key"
+    # Distributor data changes whenever the sheet is pushed, so a cached
+    # reply can show a farmer stale results. Never cache API responses.
+    r.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0"
+    r.headers["Pragma"]="no-cache"
+    r.headers["Expires"]="0"
     return r
 
 @app.route("/find",methods=["OPTIONS"])
@@ -186,9 +191,21 @@ def find():
     pin=getpin()
     if not pin: return jsonify({"count":0,"distributors":[],"message":"कृपया सही 6 अंकों का पिनकोड भेजें।"}),400
     try:
-        m,lvl=nearest(pin)
-        if not m: return jsonify({"count":0,"match_level":"none","distributors":[],"message":"पिनकोड "+pin+" के पास कोई डिस्ट्रीब्यूटर नहीं मिला। Neev Seeds से सीधे संपर्क करें। 🙏"})
+        # 1) SHEET FIRST - it is the master source.
+        #    Checking the old distributors table first would bail out on
+        #    any pincode that exists only in the sheet.
         srows, slvl = sheet_nearest(pin)
+
+        # 2) Structured table, used for the website cards and as fallback
+        m, lvl = nearest(pin)
+
+        if not srows and not m:
+            return jsonify({
+                "count": 0, "match_level": "none", "source": "none",
+                "distributors": [],
+                "message": "पिनकोड " + pin + " के पास कोई Neev Seeds डिस्ट्रीब्यूटर नहीं मिला।\nकृपया Neev Seeds से सीधे संपर्क करें। 🙏"
+            })
+
         return jsonify({
             "count": len(srows) if srows else len(m),
             "match_level": slvl if srows else lvl,
