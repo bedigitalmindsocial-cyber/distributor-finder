@@ -7,6 +7,9 @@ logging.basicConfig(level=logging.INFO)
 app=Flask(__name__)
 DATABASE_URL=os.environ.get("DATABASE_URL","")
 ADMIN_KEY=os.environ.get("ADMIN_KEY","neev2024admin")
+# Legacy Tally table fallback. Default OFF: stale data must never
+# reach a farmer silently. Set USE_LEGACY_FALLBACK=true to re-enable.
+USE_LEGACY=os.environ.get("USE_LEGACY_FALLBACK","false").lower()=="true"
 
 @app.after_request
 def add_cors(r):
@@ -164,8 +167,31 @@ def pins_in_text(s):
 # Google Sheet is the master source. sheet_distributors holds one row
 # per distributor with the exact Hindi text the team curated.
 # Same 6->5->4->3 cascade, filling up to 5 results.
+def extract_mobile(text):
+    """First Indian mobile number written inside the Hindi details text."""
+    flat = re.sub(r"[\s\-]", "", str(text or ""))
+    nums = re.findall(r"(?<!\d)[6-9]\d{9}(?!\d)", flat)
+    return ", ".join(dict.fromkeys(nums)) if nums else ""
+
+
+def sheet_cards(rows):
+    """Structured cards for the website, built from the SHEET table.
+       No second source of truth - name and address come from the
+       sheet's own columns, the mobile is parsed out of the Hindi text."""
+    out = []
+    for r in rows:
+        hi = r.get("details_hi") or ""
+        out.append({
+            "Distributor Name": (r.get("name") or hi.split("\n")[0][:80]).strip(),
+            "Address":          (r.get("address") or "").strip(),
+            "Mobile Number":    extract_mobile(hi),
+            "Pincode":          r.get("pincode", ""),
+        })
+    return out
+
+
 def sheet_nearest(pin):
-    """Return up to 5 distributor detail strings, nearest first."""
+    """Return up to 5 distributor rows, nearest first."""
     pi = int(pin)
     seen = set()
     out  = []
@@ -178,13 +204,13 @@ def sheet_nearest(pin):
                 seen.add(key)
                 out.append(r)
 
-    add(qry("SELECT pincode,details_hi FROM sheet_distributors WHERE pincode=%s", (pin,)))
+    add(qry("SELECT pincode,details_hi,name,address FROM sheet_distributors WHERE pincode=%s", (pin,)))
     if len(out) < 5:
-        add(qry("SELECT pincode,details_hi FROM sheet_distributors WHERE pincode LIKE %s", (pin[:5]+"%",)))
+        add(qry("SELECT pincode,details_hi,name,address FROM sheet_distributors WHERE pincode LIKE %s", (pin[:5]+"%",)))
     if len(out) < 5:
-        add(qry("SELECT pincode,details_hi FROM sheet_distributors WHERE pincode LIKE %s", (pin[:4]+"%",)))
+        add(qry("SELECT pincode,details_hi,name,address FROM sheet_distributors WHERE pincode LIKE %s", (pin[:4]+"%",)))
     if len(out) < 5:
-        add(qry("SELECT pincode,details_hi FROM sheet_distributors WHERE pincode LIKE %s", (pin[:3]+"%",)))
+        add(qry("SELECT pincode,details_hi,name,address FROM sheet_distributors WHERE pincode LIKE %s", (pin[:3]+"%",)))
 
     if not out:
         return [], "none"
@@ -237,33 +263,48 @@ def getpin():
 @app.route("/find",methods=["GET","POST"])
 def find():
     pin=getpin()
-    if not pin: return jsonify({"count":0,"distributors":[],"message":"कृपया सही 6 अंकों का पिनकोड भेजें।"}),400
+    if not pin:
+        return jsonify({"count":0,"distributors":[],
+                        "message":"कृपया सही 6 अंकों का पिनकोड भेजें।"}),400
     try:
-        # 1) SHEET FIRST - it is the master source.
-        #    Checking the old distributors table first would bail out on
-        #    any pincode that exists only in the sheet.
+        # SINGLE SOURCE OF TRUTH: the Google Sheet.
         srows, slvl = sheet_nearest(pin)
-
-        # 2) Structured table, used for the website cards and as fallback
-        m, lvl = nearest(pin)
-
-        if not srows and not m:
+        if srows:
             return jsonify({
-                "count": 0, "match_level": "none", "source": "none",
-                "distributors": [],
-                "message": "पिनकोड " + pin + " के पास कोई Neev Seeds डिस्ट्रीब्यूटर नहीं मिला।\nकृपया Neev Seeds से सीधे संपर्क करें। 🙏"
+                "count":        len(srows),
+                "match_level":  slvl,
+                "source":       "sheet",
+                "distributors": sheet_cards(srows),
+                "message":      fmt_sheet(srows, slvl)
             })
 
+        # Optional legacy fallback. OFF unless USE_LEGACY_FALLBACK=true
+        # in Render. Kept only for emergencies - the data is a stale
+        # Tally export and is never refreshed by the sheet.
+        if USE_LEGACY:
+            m, lvl = nearest(pin)
+            if m:
+                logging.warning("LEGACY FALLBACK used for pin=%s", pin)
+                return jsonify({
+                    "count":        len(m),
+                    "match_level":  lvl,
+                    "source":       "legacy_stale",
+                    "warning":      "served from the old Tally table, not the Google Sheet",
+                    "distributors": [{"Distributor Name":d["name"],
+                                      "Address":d["address"],
+                                      "Mobile Number":d["mobile"],
+                                      "Pincode":d["pincode"]} for d in m],
+                    "message":      fmt(m, lvl)
+                })
+
         return jsonify({
-            "count": len(srows) if srows else len(m),
-            "match_level": slvl if srows else lvl,
-            "source": "sheet" if srows else "database",
-            "distributors": [{"Distributor Name":d["name"],"Address":d["address"],"Mobile Number":d["mobile"]} for d in m],
-            "message": fmt_sheet(srows, slvl) if srows else fmt(m, lvl)
+            "count":0,"match_level":"none","source":"none","distributors":[],
+            "message":"पिनकोड "+pin+" के पास कोई Neev Seeds डिस्ट्रीब्यूटर नहीं मिला।\nकृपया Neev Seeds से सीधे संपर्क करें। 🙏"
         })
     except Exception as e:
         logging.error("find: %s",e)
-        return jsonify({"count":0,"distributors":[],"message":"सेवा अस्थायी रूप से उपलब्ध नहीं।"}),500
+        return jsonify({"count":0,"distributors":[],
+                        "message":"सेवा अस्थायी रूप से उपलब्ध नहीं।"}),500
 
 WX={0:"☀️",1:"🌤",2:"⛅",3:"☁️",45:"🌫",61:"🌧",63:"🌧",65:"🌧",80:"🌦",95:"⛈"}
 DAYS=["सोमवार","मंगलवार","बुधवार","गुरुवार","शुक्रवार","शनिवार","रविवार"]
@@ -548,6 +589,71 @@ def sheet_audit():
         "whatsapp_over_4096": {"count": len(over_limit),   "rows": over_limit[:25]},
     })
 
+@app.route("/admin/tables", methods=["GET"])
+@auth
+def tables_status():
+    """Every table, its row count, and whether it should exist."""
+    def count(t):
+        try: return one("SELECT COUNT(*) as c FROM " + t)["c"]
+        except Exception: return None
+
+    live    = count("sheet_distributors")
+    staging = count("sheet_staging")
+    legacy  = count("distributors")
+
+    # PIN codes served ONLY by the stale legacy table
+    orphans = []
+    if legacy:
+        try:
+            orphans = qry("""SELECT DISTINCT d.pincode
+                             FROM distributors d
+                             LEFT JOIN sheet_distributors s ON s.pincode = d.pincode
+                             WHERE s.pincode IS NULL
+                             ORDER BY d.pincode LIMIT 50""")
+        except Exception:
+            orphans = []
+
+    return jsonify({
+        "legacy_fallback_enabled": USE_LEGACY,
+        "tables": [
+            {"name":"sheet_distributors","rows":live,"role":"MASTER - from Google Sheet",
+             "status":"ok" if live else "EMPTY - push from the sheet"},
+            {"name":"sheet_staging","rows":staging,"role":"temporary upload buffer",
+             "status":"ok" if not staging else "leftover rows from an interrupted push"},
+            {"name":"distributors","rows":legacy,"role":"LEGACY Tally export - not updated by the sheet",
+             "status":("ignored - fallback disabled" if not USE_LEGACY
+                       else "ACTIVE FALLBACK - can serve stale data")},
+        ],
+        "pincodes_only_in_legacy": {
+            "count": len(orphans),
+            "sample": [o["pincode"] for o in orphans[:25]],
+            "note": ("These PINs exist only in the old Tally table. With the "
+                     "fallback disabled they return 'not found'. If any are "
+                     "real, add them to the Google Sheet.")
+        }
+    })
+
+@app.route("/admin/tables/drop-legacy", methods=["POST"])
+@auth
+def drop_legacy():
+    """Remove the stale Tally table for good. The sheet is the master."""
+    if USE_LEGACY:
+        return jsonify({"error":"Set USE_LEGACY_FALLBACK=false in Render first, "
+                                "then redeploy, then drop."}), 400
+    n = None
+    try: n = one("SELECT COUNT(*) as c FROM distributors")["c"]
+    except Exception: pass
+    run("DROP TABLE IF EXISTS distributors")
+    return jsonify({"message":"legacy table dropped","rows_removed":n})
+
+@app.route("/admin/sheet/staging", methods=["GET"])
+@auth
+def staging_status():
+    n = one("SELECT COUNT(*) as c FROM sheet_staging")["c"]
+    return jsonify({"staged_rows":n,
+                    "status":"clean" if n==0 else "leftover from an interrupted push",
+                    "safe_to_clear": True})
+
 @app.route("/admin/sheet/reset", methods=["POST"])
 @auth
 def sheet_reset():
@@ -598,12 +704,14 @@ def wa_plain():
         return Response("कृपया सही 6 अंकों का पिनकोड भेजें।\nजैसे: 152116",
                         mimetype="text/plain; charset=utf-8")
     try:
-        # 1) Sheet is master
+        # SINGLE SOURCE OF TRUTH: the Google Sheet.
         srows, slvl = sheet_nearest(pin)
         if srows:
             return Response(fmt_sheet(srows, slvl), mimetype="text/plain; charset=utf-8")
-        # 2) Fallback to structured table
-        m, lvl = nearest(pin)
+
+        m, lvl = (nearest(pin) if USE_LEGACY else ([], "none"))
+        if m:
+            logging.warning("LEGACY FALLBACK used for pin=%s", pin)
         if not m:
             return Response("पिनकोड " + pin + " के पास कोई Neev Seeds डिस्ट्रीब्यूटर नहीं मिला।\nकृपया Neev Seeds से सीधे संपर्क करें। 🙏",
                             mimetype="text/plain; charset=utf-8")
@@ -660,110 +768,179 @@ def wa_weather_plain():
 # ---- DIAGNOSTIC TEST PAGE ----
 TEST_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Neev Seeds API - System Test</title>
+<title>Neev Seeds - System Diagnostic</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:#F6F5F2;color:#040D1E;padding:24px 16px;line-height:1.5}
-.wrap{max-width:820px;margin:0 auto}
-h1{font-size:22px;margin-bottom:4px;color:#134094}
-.sub{font-size:13px;color:#737373;margin-bottom:24px}
-.card{background:#fff;border:1px solid #E0DCD4;border-radius:10px;padding:18px 20px;margin-bottom:12px}
-.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:#737373;margin-bottom:12px;font-weight:700}
-.row{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #F0EEE9;font-size:14px}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+background:#F6F5F2;color:#040D1E;padding:24px 16px;line-height:1.5}
+.wrap{max-width:860px;margin:0 auto}
+h1{font-size:21px;margin-bottom:3px;color:#134094}
+.sub{font-size:13px;color:#737373;margin-bottom:20px}
+.card{background:#fff;border:1px solid #E0DCD4;border-radius:10px;padding:16px 20px;margin-bottom:12px}
+.card h2{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:#737373;
+margin-bottom:10px;font-weight:700}
+.row{display:flex;align-items:flex-start;gap:10px;padding:7px 0;
+border-bottom:1px solid #F2F0EC;font-size:14px}
 .row:last-child{border-bottom:none}
-.dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;background:#CCC}
+.dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;background:#CCC;margin-top:6px}
 .dot.ok{background:#16A34A}.dot.bad{background:#DC2626}.dot.warn{background:#F7A600}
 .lbl{flex:1;min-width:0}
-.val{font-weight:600;font-size:13px;text-align:right;word-break:break-word;max-width:55%}
+.tier{font-size:11px;color:#999;display:block}
+.val{font-weight:600;font-size:13px;text-align:right;max-width:48%;word-break:break-word}
 .val.ok{color:#16A34A}.val.bad{color:#DC2626}.val.warn{color:#C97C00}
-pre{background:#F6F5F2;border:1px solid #E0DCD4;border-radius:8px;padding:12px;font-size:11.5px;white-space:pre-wrap;word-break:break-word;margin-top:10px;max-height:280px;overflow:auto;font-family:ui-monospace,Menlo,monospace}
-.pill{display:inline-block;background:#134094;color:#fff;border-radius:20px;padding:2px 9px;font-size:10.5px;font-weight:600;margin-left:6px}
-.pill.g{background:#16A34A}.pill.r{background:#DC2626}.pill.o{background:#F7A600;color:#040D1E}
-.verdict{border-radius:10px;padding:16px 20px;margin-bottom:16px;font-weight:600;font-size:15px}
+pre{background:#F6F5F2;border:1px solid #E0DCD4;border-radius:8px;padding:12px;
+font-size:11.5px;white-space:pre-wrap;word-break:break-word;margin-top:10px;
+max-height:260px;overflow:auto;font-family:ui-monospace,Menlo,monospace}
+.verdict{border-radius:10px;padding:14px 18px;margin-bottom:16px;font-weight:600;font-size:15px}
 .verdict.ok{background:#DCFCE7;border:1px solid #86EFAC;color:#15803D}
 .verdict.bad{background:#FEE2E2;border:1px solid #FCA5A5;color:#B91C1C}
-.verdict.wait{background:#FEF3C7;border:1px solid #FCD34D;color:#92400E}
-.tier{font-size:11px;color:#737373;margin-left:6px}
-button{background:#134094;color:#fff;border:none;border-radius:8px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;margin-top:8px}
+.verdict.warn{background:#FEF3C7;border:1px solid #FCD34D;color:#92400E}
+button{background:#134094;color:#fff;border:none;border-radius:8px;padding:9px 18px;
+font-size:14px;font-weight:600;cursor:pointer;font-family:inherit}
 button:hover{background:#0e2f7a}
-.foot{font-size:11.5px;color:#999;margin-top:20px;text-align:center}
+.hint{font-size:12px;color:#999;margin-top:14px;text-align:center;line-height:1.7}
+input{padding:8px 12px;border:1.5px solid #DEDAD2;border-radius:7px;font-family:inherit;
+font-size:13px;width:200px}
+.bar{display:flex;gap:8px;align-items:center;justify-content:center;margin-top:8px}
 </style></head><body><div class="wrap">
-<h1>Neev Seeds API - System Test</h1>
-<div class="sub">Live diagnostic. Refresh to re-run all checks.</div>
-<div id="verdict" class="verdict wait">Running checks...</div>
+<h1>Neev Seeds - System Diagnostic</h1>
+<div class="sub">Tests every layer end to end. Refresh to re-run.</div>
+<div id="verdict" class="verdict warn">Running checks...</div>
 
 <div class="card"><h2>1. Server &amp; Database</h2><div id="c1"></div></div>
-<div class="card"><h2>2. CORS (needed by website)</h2><div id="c2"></div></div>
+<div class="card"><h2>2. CORS &amp; Caching (website)</h2><div id="c2"></div></div>
 <div class="card"><h2>3. Cascading Match 6&rarr;5&rarr;4&rarr;3</h2><div id="c3"></div></div>
-<div class="card"><h2>4. WhatsApp Message Preview</h2><div id="c4"></div>
-<pre id="wa">loading...</pre></div>
-<div style="text-align:center"><button onclick="location.reload()">Re-run all tests</button></div>
-<div class="foot">Endpoints: /health &middot; /find &middot; /weather &middot; /admin</div>
+<div class="card"><h2>4. WhatsApp Endpoint</h2><div id="c4"></div><pre id="wa">loading...</pre></div>
+<div class="card"><h2>5. Data Quality Audit</h2><div id="c5"></div>
+  <div class="bar">
+    <input id="k" type="password" placeholder="admin key">
+    <button onclick="runAudit()">Run audit</button>
+  </div>
+</div>
+
+<div style="text-align:center;margin-top:16px">
+  <button onclick="location.reload()">Re-run all tests</button>
+</div>
+<div class="hint">
+/health &middot; /find &middot; /wa &middot; /wa/weather &middot; /admin &middot; /test<br>
+Section 5 needs the admin key. Everything else runs without it.
+</div>
 </div>
 <script>
-var B=location.origin;
-function row(el,label,val,state,extra){
+var B=location.origin, pass=0, fail=0;
+function row(el,label,val,state,sub){
   document.getElementById(el).insertAdjacentHTML('beforeend',
-    '<div class="row"><div class="dot '+state+'"></div><div class="lbl">'+label+
-    (extra?'<span class="tier">'+extra+'</span>':'')+
-    '</div><div class="val '+state+'">'+val+'</div></div>');
+   '<div class="row"><div class="dot '+state+'"></div><div class="lbl">'+label+
+   (sub?'<span class="tier">'+sub+'</span>':'')+
+   '</div><div class="val '+state+'">'+val+'</div></div>');
 }
-var score={pass:0,fail:0};
-function mark(ok){ok?score.pass++:score.fail++;}
-
+function mark(ok){ ok?pass++:fail++; }
 function verdict(){
   var v=document.getElementById('verdict');
-  if(score.fail===0){v.className='verdict ok';v.textContent='All systems operational. WhatsApp, website and Google Sheet should all work.';}
-  else{v.className='verdict bad';v.textContent=score.fail+' check(s) failed. See details below.';}
+  if(fail===0){v.className='verdict ok';
+    v.textContent='All '+pass+' checks passed. WhatsApp, website and Sheet sync are all healthy.';}
+  else{v.className='verdict bad';
+    v.textContent=fail+' of '+(pass+fail)+' checks failed. Red rows below show which layer.';}
 }
 
+// 1 + 2
 fetch(B+'/health').then(function(r){
-  var cors=r.headers.get('access-control-allow-origin');
-  return r.json().then(function(d){return {d:d,cors:cors,status:r.status}});
+  return r.json().then(function(d){return {d:d,
+    cors:r.headers.get('access-control-allow-origin'),
+    cache:r.headers.get('cache-control'), status:r.status};});
 }).then(function(o){
-  var ok=o.d.status==='ok';
-  row('c1','Server responding','HTTP '+o.status,ok?'ok':'bad');mark(ok);
-  row('c1','Database connection',ok?'connected':(o.d.message||'error').substring(0,40),ok?'ok':'bad');mark(ok);
-  row('c1','Distributors loaded',(o.d.distributors||0)+' records',o.d.distributors>0?'ok':'bad');mark(o.d.distributors>0);
+  var live=o.d.status==='ok';
+  row('c1','Server responding','HTTP '+o.status,live?'ok':'bad');mark(live);
+  row('c1','Supabase connection',live?'connected':(o.d.message||'error').substring(0,40),
+      live?'ok':'bad');mark(live);
   var sr=o.d.sheet_rows||0, sp=o.d.sheet_pincodes||0;
-  row('c1','Sheet rows synced',sr+' rows',sr>0?'ok':'warn',sp+' unique PINs');
+  row('c1','sheet_distributors (MASTER)',sr+' rows',sr>0?'ok':'bad',sp+' unique PIN codes');mark(sr>0);
+  var st=o.d.staging_rows||0;
+  row('c1','sheet_staging (temporary)',st===0?'empty':st+' leftover rows',st===0?'ok':'warn',
+      st===0?'clean':'an earlier push was interrupted');mark(st===0);
+  var lg=o.d.legacy_rows||0, lgOn=o.d.legacy_fallback_enabled;
+  row('c1','distributors (legacy Tally)',
+      lg+' rows - '+(lgOn?'ACTIVE FALLBACK':'ignored'),
+      lgOn?'warn':'ok',
+      lgOn?'can serve months-old data to farmers':'safe: sheet is the only source');
+  mark(!lgOn);
 
-  var chas=!!o.cors;
-  row('c2','Access-Control-Allow-Origin',chas?o.cors:'MISSING - website will fail',chas?'ok':'bad');mark(chas);
+  var ch=!!o.cors;
+  row('c2','Access-Control-Allow-Origin',ch?o.cors:'MISSING - website blocked',ch?'ok':'bad');mark(ch);
+  var nc=(o.cache||'').indexOf('no-store')>-1;
+  row('c2','Cache-Control',nc?'no-store':'not set - stale replies possible',nc?'ok':'warn');mark(nc);
 
   return fetch(B+'/find?pincode=152116');
 }).then(function(r){return r.json()}).then(function(d){
   var arr=d.distributors||[];
-  var hasArr=arr.length>0;
-  row('c3','distributors[] array present',hasArr?'yes':'MISSING - website/sheet will fail',hasArr?'ok':'bad');mark(hasArr);
+  var src=d.source||'unknown';
+  row('c3','Answer came from',src,src==='sheet'?'ok':'bad',
+      src==='sheet' ? 'Google Sheet - correct'
+      : src==='legacy_stale' ? 'STALE Tally data - disable the fallback'
+      : 'no data for this PIN');
+  mark(src==='sheet');
   row('c3','PIN 152116 (Abohar)',d.count+' found',d.count>=5?'ok':'warn','tier: '+(d.match_level||'?'));
   mark(d.count>=1);
-  for(var i=0;i<arr.length;i++){
-    row('c3','&nbsp;&nbsp;'+(i+1)+'. '+arr[i]['Distributor Name'],arr[i]['Mobile Number'],'ok');
-  }
+  row('c3','distributors[] for website',arr.length?arr.length+' items':'empty',arr.length?'ok':'warn');
   document.getElementById('wa').textContent=d.message||'(no message field)';
-  var wok=!!d.message;
-  row('c4','message field for WATI',wok?'present':'MISSING - WhatsApp will fail',wok?'ok':'bad');mark(wok);
-  row('c4','Character count',(d.message||'').length+' / 4096',(d.message||'').length<4096?'ok':'bad');
-  mark((d.message||'').length<4096);
-  return fetch(B+'/find?pincode=124401').then(function(r){return r.json()}).then(function(d){
-    row('c3','PIN 124401 (Rohtak)',d.count+' found',d.count>=1?'ok':'warn','tier: '+(d.match_level||'?'));
-    mark(d.count>=1);
-  }).catch(function(){});
-}).then(function(){
-  return fetch(B+'/wa?pincode=152116').then(function(r){
-    var ct=r.headers.get('content-type')||'';
-    return r.text().then(function(t){return {ct:ct,t:t}});
-  }).then(function(o){
-    var isText=o.ct.indexOf('text/plain')>-1;
-    row('c4','/wa plain-text endpoint',isText?'working ('+o.t.length+' chars)':'not deployed',isText?'ok':'bad');
-    mark(isText);
-  }).catch(function(){
-    row('c4','/wa plain-text endpoint','not reachable','bad');mark(false);
-  });
-}).then(verdict).catch(function(e){
+  var len=(d.message||'').length;
+  row('c4','message field for WATI',len?'present':'MISSING',len?'ok':'bad');mark(len>0);
+  row('c4','Length vs WhatsApp limit',len+' / 4096',len<4096?'ok':'bad');mark(len<4096);
+  return fetch(B+'/find?pincode=124401');
+}).then(function(r){return r.json()}).then(function(d){
+  row('c3','PIN 124401 (Rohtak)',d.count+' found',d.count>=1?'ok':'warn','tier: '+(d.match_level||'?'));
+  mark(d.count>=1);
+  return fetch(B+'/find?pincode=999999');
+}).then(function(r){return r.json()}).then(function(d){
+  var handled=(d.count===0);
+  row('c3','PIN 999999 (nonexistent)',handled?'correctly empty':'unexpected match',
+      handled?'ok':'warn','graceful no-match');mark(handled);
+  return fetch(B+'/wa?pincode=152116');
+}).then(function(r){
+  var ct=r.headers.get('content-type')||'';
+  return r.text().then(function(t){return {ct:ct,t:t}});
+}).then(function(o){
+  var isText=o.ct.indexOf('text/plain')>-1;
+  row('c4','/wa returns plain text',isText?'yes ('+o.t.length+' chars)':'not deployed',
+      isText?'ok':'bad','use this URL in WATI');mark(isText);
+  var isJson=o.t.trim().charAt(0)==='{';
+  row('c4','Not wrapped in JSON',isJson?'still JSON - WATI will break':'clean text',
+      isJson?'bad':'ok');mark(!isJson);
+  verdict();
+}).catch(function(e){
   row('c1','Fatal error',String(e).substring(0,60),'bad');mark(false);verdict();
 });
+
+function runAudit(){
+  var k=document.getElementById('k').value.trim();
+  if(!k){alert('Enter the admin key first.');return;}
+  document.getElementById('c5').innerHTML='';
+  fetch(B+'/admin/sheet/audit?key='+encodeURIComponent(k))
+  .then(function(r){
+    if(r.status===401){throw new Error('Wrong admin key');}
+    return r.json();
+  })
+  .then(function(d){
+    row('c5','Rows audited',d.total_rows+' rows','ok',d.unique_pincodes+' unique PIN codes');
+    var m=d.pincode_mismatch.count;
+    row('c5','PIN column vs PIN in text',m?m+' MISMATCH':'all agree',m?'bad':'ok',
+        m?'farmers sent to wrong town':'');
+    if(m) d.pincode_mismatch.rows.slice(0,5).forEach(function(x){
+      row('c5','&nbsp;&nbsp;column '+x.column_pincode+' vs text '+x.text_pincode,
+          String(x.name||'').substring(0,26),'bad');
+    });
+    var nm=d.no_mobile_found.count;
+    row('c5','Mobile number present',nm?nm+' rows have none':'all rows have one',nm?'warn':'ok');
+    var np=d.no_pincode_in_text.count;
+    row('c5','PIN written inside text',np?np+' rows missing':'all rows have one',np?'warn':'ok');
+    var dp=d.duplicate_rows.count;
+    row('c5','Duplicate rows',dp?dp+' duplicates':'none',dp?'warn':'ok');
+    var ol=d.whatsapp_over_4096.count;
+    row('c5','WhatsApp 4096 limit',ol?ol+' PINs may truncate':'all within limit',ol?'warn':'ok');
+    row('c5','Overall',d.clean?'CLEAN':d.issue_count+' issues',d.clean?'ok':'warn');
+  })
+  .catch(function(e){ row('c5','Audit failed',String(e.message||e).substring(0,50),'bad'); });
+}
 </script></body></html>"""
 
 @app.route("/test")
@@ -779,7 +956,12 @@ def health():
             u = one("SELECT COUNT(DISTINCT pincode) as c FROM sheet_distributors")["c"]
         except Exception:
             s, u = 0, 0
-        return jsonify({"status":"ok","distributors":c,"sheet_rows":s,"sheet_pincodes":u})
+        try:    st = one("SELECT COUNT(*) as c FROM sheet_staging")["c"]
+        except Exception: st = 0
+        return jsonify({"status":"ok","sheet_rows":s,"sheet_pincodes":u,
+                        "staging_rows":st,"legacy_rows":c,
+                        "legacy_fallback_enabled":USE_LEGACY,
+                        "distributors":c})
     except Exception as e:
         return jsonify({"status":"db_error","message":str(e)}),500
 
