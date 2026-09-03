@@ -54,20 +54,37 @@ def init():
     try:
         cur=c.cursor()
         cur.execute("""CREATE TABLE IF NOT EXISTS distributors(id SERIAL PRIMARY KEY,name TEXT NOT NULL,pincode TEXT NOT NULL,mobile TEXT NOT NULL,address TEXT NOT NULL,updated_at TIMESTAMPTZ DEFAULT NOW())""")
-        # Sheet-sourced table: ONE ROW PER DISTRIBUTOR.
-        # Stores every column from the Google Sheet.
-        # Render only reads pincode + details_hi; the rest is archived
-        # so the full sheet can be rebuilt from Supabase if ever needed.
+        # ---- Sheet-sourced table: ONE ROW PER DISTRIBUTOR ----
+        # Stores every column from the Google Sheet. Render reads only
+        # pincode + details_hi; the rest is archived for future use.
+        #
+        # Uses a MIGRATION, not a plain CREATE. An earlier deploy may have
+        # left an older version of this table behind, and CREATE TABLE IF
+        # NOT EXISTS would silently skip it, leaving the new columns absent.
         cur.execute("""CREATE TABLE IF NOT EXISTS sheet_distributors(
             id         SERIAL PRIMARY KEY,
-            s_no       TEXT,
-            address    TEXT,
-            name       TEXT,
             pincode    TEXT NOT NULL,
-            details_en TEXT,
-            details_hi TEXT NOT NULL,
-            details_pa TEXT,
             updated_at TIMESTAMPTZ DEFAULT NOW())""")
+
+        cur.execute("""SELECT column_name FROM information_schema.columns
+                       WHERE table_schema='public'
+                         AND table_name='sheet_distributors'""")
+        have = set(r[0] for r in cur.fetchall())
+
+        # Legacy: single "details" column becomes details_hi
+        if "details" in have and "details_hi" not in have:
+            cur.execute("ALTER TABLE sheet_distributors RENAME COLUMN details TO details_hi")
+            have.discard("details"); have.add("details_hi")
+            logging.info("migrated: details -> details_hi")
+
+        for colname in ("s_no", "address", "name", "details_en", "details_hi", "details_pa"):
+            if colname not in have:
+                cur.execute("ALTER TABLE sheet_distributors ADD COLUMN " + colname + " TEXT")
+                logging.info("migrated: added column %s", colname)
+
+        # Old NOT NULL on details_hi blocks rows that legitimately lack it
+        cur.execute("ALTER TABLE sheet_distributors ALTER COLUMN details_hi DROP NOT NULL")
+
         cur.execute("""CREATE INDEX IF NOT EXISTS idx_sheet_pin
                        ON sheet_distributors(pincode)""")
         cur.execute("DROP TABLE IF EXISTS pincode_details")
@@ -289,6 +306,47 @@ def sheet_list():
 def sheet_clear():
     run("DELETE FROM sheet_distributors")
     return jsonify({"message": "cleared", "total_rows": 0})
+
+@app.route("/admin/sheet/schema", methods=["GET"])
+@auth
+def sheet_schema():
+    """Show the live column list - useful when a push fails on a column."""
+    cols = qry("""SELECT column_name, data_type, is_nullable
+                  FROM information_schema.columns
+                  WHERE table_schema='public' AND table_name='sheet_distributors'
+                  ORDER BY ordinal_position""")
+    missing = [f for f in SHEET_FIELDS if f not in [c["column_name"] for c in cols]]
+    return jsonify({"columns": cols, "missing": missing, "ready": not missing})
+
+@app.route("/admin/sheet/reset", methods=["POST"])
+@auth
+def sheet_reset():
+    """Drop and rebuild the table from scratch. The sheet is the master
+       copy, so nothing is lost - just push again afterwards."""
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("DROP TABLE IF EXISTS sheet_distributors")
+        cur.execute("""CREATE TABLE sheet_distributors(
+            id         SERIAL PRIMARY KEY,
+            s_no       TEXT,
+            address    TEXT,
+            name       TEXT,
+            pincode    TEXT NOT NULL,
+            details_en TEXT,
+            details_hi TEXT,
+            details_pa TEXT,
+            updated_at TIMESTAMPTZ DEFAULT NOW())""")
+        cur.execute("CREATE INDEX idx_sheet_pin ON sheet_distributors(pincode)")
+    except Exception as e:
+        logging.error("sheet_reset: %s", e)
+        try: c.close()
+        except Exception: pass
+        return jsonify({"error": str(e)[:200]}), 500
+    finally:
+        try: c.close()
+        except Exception: pass
+    return jsonify({"message": "table rebuilt", "total_rows": 0})
 
 @app.route("/admin/sheet", methods=["POST"])
 @auth
