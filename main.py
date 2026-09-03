@@ -92,6 +92,20 @@ def init():
 
         cur.execute("""CREATE INDEX IF NOT EXISTS idx_sheet_pin
                        ON sheet_distributors(pincode)""")
+
+        # Staging table. Rows land here first; the live table is only
+        # swapped once every batch has arrived. A failed push therefore
+        # leaves the live data untouched instead of half-deleted.
+        cur.execute("""CREATE TABLE IF NOT EXISTS sheet_staging(
+            id         SERIAL PRIMARY KEY,
+            s_no       TEXT,
+            address    TEXT,
+            name       TEXT,
+            pincode    TEXT NOT NULL,
+            details_en TEXT,
+            details_hi TEXT,
+            details_pa TEXT)""")
+
         cur.execute("DROP TABLE IF EXISTS pincode_details")
         cur.execute("SELECT COUNT(*) FROM distributors")
         n=cur.fetchone()[0]
@@ -110,6 +124,40 @@ def auth(f):
         if key!=ADMIN_KEY: return jsonify({"error":"Unauthorized"}),401
         return f(*a,**k)
     return dec
+
+
+
+# ---- TEXT SANITISER ----
+# Google Sheets routinely carries invisible characters that survive a
+# copy-paste: non-breaking spaces, zero-width joiners, BOM marks. They
+# are invisible in the sheet and in Supabase, but they break exact
+# matching and can render as boxes on some Android WhatsApp builds.
+_INVISIBLE = {
+    "\u00a0": " ",   # non-breaking space
+    "\u200b": "",    # zero-width space
+    "\u200c": "",    # zero-width non-joiner
+    "\u200d": "",    # zero-width joiner
+    "\u200e": "",    # left-to-right mark
+    "\u200f": "",    # right-to-left mark
+    "\ufeff": "",    # byte-order mark
+    "\u2028": "\n",  # line separator
+    "\u2029": "\n",  # paragraph separator
+}
+
+def clean_text(s):
+    if s is None:
+        return ""
+    s = str(s)
+    for bad, good in _INVISIBLE.items():
+        s = s.replace(bad, good)
+    s = re.sub(r"[ \t]+", " ", s)        # collapse runs of spaces
+    s = re.sub(r"\n{3,}", "\n\n", s)     # collapse blank-line runs
+    return s.strip()
+
+
+def pins_in_text(s):
+    """Every standalone 6-digit number inside a details string."""
+    return re.findall(r"(?<!\d)\d{6}(?!\d)", str(s or ""))
 
 
 # ---- SHEET-FIRST LOOKUP ----
@@ -313,64 +361,36 @@ SHEET_FIELDS = ["s_no","address","name","pincode","details_en","details_hi","det
 def sheet_list():
     total = one("SELECT COUNT(*) as c FROM sheet_distributors")["c"]
     uniq  = one("SELECT COUNT(DISTINCT pincode) as c FROM sheet_distributors")["c"]
-    sample = qry("SELECT * FROM sheet_distributors ORDER BY id LIMIT 5")
-    for r in sample:
-        if r.get("updated_at"): r["updated_at"] = str(r["updated_at"])
-    return jsonify({"total_rows": total, "unique_pincodes": uniq, "sample": sample})
-
-@app.route("/admin/sheet/clear", methods=["POST"])
-@auth
-def sheet_clear():
-    run("DELETE FROM sheet_distributors")
-    return jsonify({"message": "cleared", "total_rows": 0})
+    return jsonify({"total_rows": total, "unique_pincodes": uniq})
 
 @app.route("/admin/sheet/schema", methods=["GET"])
 @auth
 def sheet_schema():
-    """Show the live column list - useful when a push fails on a column."""
-    cols = qry("""SELECT column_name, data_type, is_nullable
+    cols = qry("""SELECT column_name, data_type
                   FROM information_schema.columns
                   WHERE table_schema='public' AND table_name='sheet_distributors'
                   ORDER BY ordinal_position""")
-    missing = [f for f in SHEET_FIELDS if f not in [c["column_name"] for c in cols]]
-    return jsonify({"columns": cols, "missing": missing, "ready": not missing})
+    names   = [c["column_name"] for c in cols]
+    missing = [f for f in SHEET_FIELDS if f not in names]
+    staging = one("""SELECT COUNT(*) as c FROM information_schema.tables
+                     WHERE table_schema='public' AND table_name='sheet_staging'""")["c"]
+    return jsonify({"columns": cols, "missing": missing,
+                    "staging_exists": staging > 0,
+                    "ready": (not missing) and staging > 0})
 
-@app.route("/admin/sheet/reset", methods=["POST"])
+# ---- ATOMIC PUSH: begin -> load batches -> commit ----
+@app.route("/admin/sheet/begin", methods=["POST"])
 @auth
-def sheet_reset():
-    """Drop and rebuild the table from scratch. The sheet is the master
-       copy, so nothing is lost - just push again afterwards."""
-    c = conn()
-    try:
-        cur = c.cursor()
-        cur.execute("DROP TABLE IF EXISTS sheet_distributors")
-        cur.execute("""CREATE TABLE sheet_distributors(
-            id         SERIAL PRIMARY KEY,
-            s_no       TEXT,
-            address    TEXT,
-            name       TEXT,
-            pincode    TEXT NOT NULL,
-            details_en TEXT,
-            details_hi TEXT,
-            details_pa TEXT,
-            updated_at TIMESTAMPTZ DEFAULT NOW())""")
-        cur.execute("CREATE INDEX idx_sheet_pin ON sheet_distributors(pincode)")
-    except Exception as e:
-        logging.error("sheet_reset: %s", e)
-        try: c.close()
-        except Exception: pass
-        return jsonify({"error": str(e)[:200]}), 500
-    finally:
-        try: c.close()
-        except Exception: pass
-    return jsonify({"message": "table rebuilt", "total_rows": 0})
+def sheet_begin():
+    """Empty the staging table. Live data is NOT touched."""
+    run("DELETE FROM sheet_staging")
+    live = one("SELECT COUNT(*) as c FROM sheet_distributors")["c"]
+    return jsonify({"message": "staging cleared", "live_rows_untouched": live})
 
 @app.route("/admin/sheet", methods=["POST"])
 @auth
-def sheet_upsert():
-    """Bulk insert from the Google Sheet - ONE ROW PER DISTRIBUTOR.
-       Body: {"rows":[{s_no,address,name,pincode,details_en,details_hi,details_pa}]}
-       Only pincode and details_hi are required. One multi-VALUES INSERT."""
+def sheet_load():
+    """Load one batch into STAGING. Nothing goes live until /commit."""
     body = request.get_json(silent=True) or {}
     rows = body.get("rows", [])
     if not isinstance(rows, list):
@@ -379,39 +399,37 @@ def sheet_upsert():
     clean, skipped = [], []
     for i, r in enumerate(rows):
         pin = re.sub(r"\D", "", str(r.get("pincode", "")))
-        hi  = str(r.get("details_hi", "")).strip()
+        hi  = clean_text(r.get("details_hi"))
         if len(pin) != 6:
             skipped.append({"index": i, "reason": "pincode not 6 digits"}); continue
         if not hi:
             skipped.append({"index": i, "reason": "Hindi details empty"}); continue
         clean.append((
-            str(r.get("s_no", "")).strip()       or None,
-            str(r.get("address", "")).strip()    or None,
-            str(r.get("name", "")).strip()       or None,
+            clean_text(r.get("s_no"))       or None,
+            clean_text(r.get("address"))    or None,
+            clean_text(r.get("name"))       or None,
             pin,
-            str(r.get("details_en", "")).strip() or None,
+            clean_text(r.get("details_en")) or None,
             hi,
-            str(r.get("details_pa", "")).strip() or None,
+            clean_text(r.get("details_pa")) or None,
         ))
 
     if not clean:
-        return jsonify({"saved": 0, "skipped": len(skipped),
-                        "skipped_detail": skipped[:20], "total_rows": 0})
+        return jsonify({"loaded": 0, "skipped": len(skipped),
+                        "skipped_detail": skipped[:20], "staged_total": 0})
 
     c = conn()
     try:
         cur = c.cursor()
-        ph = ",".join(["(%s,%s,%s,%s,%s,%s,%s,NOW())"] * len(clean))
+        ph = ",".join(["(%s,%s,%s,%s,%s,%s,%s)"] * len(clean))
         params = []
         for row in clean:
             params.extend(row)
-        cur.execute(
-            "INSERT INTO sheet_distributors(" + ",".join(SHEET_FIELDS) + ",updated_at) VALUES " + ph,
-            params)
-        cur.execute("SELECT COUNT(*) FROM sheet_distributors")
-        total = cur.fetchone()[0]
+        cur.execute("INSERT INTO sheet_staging(" + ",".join(SHEET_FIELDS) + ") VALUES " + ph, params)
+        cur.execute("SELECT COUNT(*) FROM sheet_staging")
+        staged = cur.fetchone()[0]
     except Exception as e:
-        logging.error("sheet_upsert: %s", e)
+        logging.error("sheet_load: %s", e)
         try: c.close()
         except Exception: pass
         return jsonify({"error": str(e)[:200]}), 500
@@ -419,8 +437,143 @@ def sheet_upsert():
         try: c.close()
         except Exception: pass
 
-    return jsonify({"saved": len(clean), "skipped": len(skipped),
-                    "skipped_detail": skipped[:20], "total_rows": total})
+    return jsonify({"loaded": len(clean), "skipped": len(skipped),
+                    "skipped_detail": skipped[:20], "staged_total": staged})
+
+@app.route("/admin/sheet/commit", methods=["POST"])
+@auth
+def sheet_commit():
+    """Swap staging into live inside ONE transaction.
+       Refuses to commit an empty staging table - that would wipe
+       everything if an earlier batch silently failed."""
+    body     = request.get_json(silent=True) or {}
+    expected = body.get("expected_rows")
+
+    staged = one("SELECT COUNT(*) as c FROM sheet_staging")["c"]
+    live   = one("SELECT COUNT(*) as c FROM sheet_distributors")["c"]
+
+    if staged == 0:
+        return jsonify({"error": "staging is empty - refusing to wipe live data",
+                        "staged": 0, "live_rows": live}), 400
+
+    if expected is not None and int(expected) != staged:
+        return jsonify({"error": "row count mismatch - some batches did not arrive",
+                        "expected": int(expected), "staged": staged,
+                        "live_rows": live, "committed": False}), 409
+
+    c = conn()
+    try:
+        c.autocommit = False
+        cur = c.cursor()
+        cur.execute("DELETE FROM sheet_distributors")
+        cur.execute("""INSERT INTO sheet_distributors(""" + ",".join(SHEET_FIELDS) + """,updated_at)
+                       SELECT """ + ",".join(SHEET_FIELDS) + """, NOW() FROM sheet_staging""")
+        cur.execute("SELECT COUNT(*) FROM sheet_distributors")
+        final = cur.fetchone()[0]
+        c.commit()
+    except Exception as e:
+        try: c.rollback()
+        except Exception: pass
+        logging.error("sheet_commit: %s", e)
+        try: c.close()
+        except Exception: pass
+        return jsonify({"error": str(e)[:200], "committed": False,
+                        "live_rows": live}), 500
+    finally:
+        try: c.close()
+        except Exception: pass
+
+    return jsonify({"committed": True, "live_rows": final,
+                    "previous_rows": live, "staged": staged})
+
+# ---- DATA QUALITY AUDIT ----
+@app.route("/admin/sheet/audit", methods=["GET"])
+@auth
+def sheet_audit():
+    """Inspect LIVE data for problems the pipeline cannot see by itself."""
+    rows = qry("SELECT id,s_no,name,pincode,details_hi FROM sheet_distributors ORDER BY pincode")
+
+    pin_mismatch, no_pin_in_text, no_mobile, very_long, dupes = [], [], [], [], []
+    seen = {}
+
+    for r in rows:
+        hi   = r["details_hi"] or ""
+        pins = pins_in_text(hi)
+
+        if not pins:
+            no_pin_in_text.append({"id": r["id"], "pincode": r["pincode"],
+                                   "name": (r["name"] or hi[:45])})
+        elif r["pincode"] not in pins:
+            pin_mismatch.append({"id": r["id"], "column_pincode": r["pincode"],
+                                 "text_pincode": pins[0],
+                                 "name": (r["name"] or hi[:45])})
+
+        if not re.search(r"(?<!\d)[6-9]\d{9}(?!\d)", re.sub(r"[\s-]", "", hi)):
+            no_mobile.append({"id": r["id"], "pincode": r["pincode"],
+                              "name": (r["name"] or hi[:45])})
+
+        if len(hi) > 400:
+            very_long.append({"id": r["id"], "pincode": r["pincode"], "chars": len(hi)})
+
+        key = (r["pincode"], hi.strip())
+        if key in seen:
+            dupes.append({"id": r["id"], "duplicate_of": seen[key], "pincode": r["pincode"]})
+        else:
+            seen[key] = r["id"]
+
+    # Worst-case WhatsApp message size per pincode
+    over_limit = []
+    bypin = {}
+    for r in rows:
+        bypin.setdefault(r["pincode"], []).append(len(r["details_hi"] or ""))
+    for pin, lens in bypin.items():
+        top5 = sorted(lens, reverse=True)[:5]
+        approx = sum(top5) + 60 * len(top5) + 120
+        if approx > 4096:
+            over_limit.append({"pincode": pin, "approx_chars": approx})
+
+    issues = (len(pin_mismatch) + len(no_pin_in_text) + len(no_mobile)
+              + len(dupes) + len(over_limit))
+
+    return jsonify({
+        "total_rows": len(rows),
+        "unique_pincodes": len(bypin),
+        "issue_count": issues,
+        "clean": issues == 0,
+        "pincode_mismatch": {"count": len(pin_mismatch), "rows": pin_mismatch[:25]},
+        "no_pincode_in_text": {"count": len(no_pin_in_text), "rows": no_pin_in_text[:25]},
+        "no_mobile_found":    {"count": len(no_mobile),    "rows": no_mobile[:25]},
+        "duplicate_rows":     {"count": len(dupes),        "rows": dupes[:25]},
+        "very_long_text":     {"count": len(very_long),    "rows": very_long[:25]},
+        "whatsapp_over_4096": {"count": len(over_limit),   "rows": over_limit[:25]},
+    })
+
+@app.route("/admin/sheet/reset", methods=["POST"])
+@auth
+def sheet_reset():
+    c = conn()
+    try:
+        cur = c.cursor()
+        for tbl in ("sheet_distributors", "sheet_staging"):
+            cur.execute("DROP TABLE IF EXISTS " + tbl)
+        cur.execute("""CREATE TABLE sheet_distributors(
+            id SERIAL PRIMARY KEY, s_no TEXT, address TEXT, name TEXT,
+            pincode TEXT NOT NULL, details_en TEXT, details_hi TEXT,
+            details_pa TEXT, updated_at TIMESTAMPTZ DEFAULT NOW())""")
+        cur.execute("CREATE INDEX idx_sheet_pin ON sheet_distributors(pincode)")
+        cur.execute("""CREATE TABLE sheet_staging(
+            id SERIAL PRIMARY KEY, s_no TEXT, address TEXT, name TEXT,
+            pincode TEXT NOT NULL, details_en TEXT, details_hi TEXT,
+            details_pa TEXT)""")
+    except Exception as e:
+        logging.error("sheet_reset: %s", e)
+        try: c.close()
+        except Exception: pass
+        return jsonify({"error": str(e)[:200]}), 500
+    finally:
+        try: c.close()
+        except Exception: pass
+    return jsonify({"message": "tables rebuilt", "total_rows": 0})
 
 @app.route("/admin")
 def admin_ui():
