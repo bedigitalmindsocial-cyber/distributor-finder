@@ -54,11 +54,16 @@ def init():
     try:
         cur=c.cursor()
         cur.execute("""CREATE TABLE IF NOT EXISTS distributors(id SERIAL PRIMARY KEY,name TEXT NOT NULL,pincode TEXT NOT NULL,mobile TEXT NOT NULL,address TEXT NOT NULL,updated_at TIMESTAMPTZ DEFAULT NOW())""")
-        # Sheet-sourced table: PIN Code -> Complete Distributor Details (in Hindi)
-        cur.execute("""CREATE TABLE IF NOT EXISTS pincode_details(
-            pincode TEXT PRIMARY KEY,
+        # Sheet-sourced table: ONE ROW PER DISTRIBUTOR.
+        # Many rows may share the same pincode - that is expected.
+        cur.execute("""CREATE TABLE IF NOT EXISTS sheet_distributors(
+            id SERIAL PRIMARY KEY,
+            pincode TEXT NOT NULL,
             details TEXT NOT NULL,
             updated_at TIMESTAMPTZ DEFAULT NOW())""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS idx_sheet_pin
+                       ON sheet_distributors(pincode)""")
+        cur.execute("DROP TABLE IF EXISTS pincode_details")
         cur.execute("SELECT COUNT(*) FROM distributors")
         n=cur.fetchone()[0]
         if n==0:
@@ -79,22 +84,47 @@ def auth(f):
 
 
 # ---- SHEET-FIRST LOOKUP ----
-# Google Sheet is the master source. pincode_details holds the exact
-# Hindi text the team curated per PIN. If a PIN is not in the sheet,
-# fall back to the 6->5->4->3 cascade over the structured table.
-def sheet_details(pin):
-    """Exact PIN, then 5/4/3-digit prefix, from the sheet-sourced table."""
-    r = one("SELECT details FROM pincode_details WHERE pincode=%s", (pin,))
-    if r: return r["details"], "exact"
+# Google Sheet is the master source. sheet_distributors holds one row
+# per distributor with the exact Hindi text the team curated.
+# Same 6->5->4->3 cascade, filling up to 5 results.
+def sheet_nearest(pin):
+    """Return up to 5 distributor detail strings, nearest first."""
+    pi = int(pin)
+    seen = set()
+    out  = []
 
-    for cut, lvl in ((5, "nearby"), (4, "nearby"), (3, "district")):
-        rows = qry("SELECT pincode,details FROM pincode_details WHERE pincode LIKE %s",
-                   (pin[:cut] + "%",))
-        if rows:
-            pi = int(pin)
-            rows.sort(key=lambda x: abs(int(x["pincode"]) - pi))
-            return rows[0]["details"], lvl
-    return None, "none"
+    def add(rows):
+        rows = sorted(rows, key=lambda r: abs(int(r["pincode"]) - pi))
+        for r in rows:
+            key = r["details"].strip()
+            if key not in seen and len(out) < 5:
+                seen.add(key)
+                out.append(r)
+
+    add(qry("SELECT pincode,details FROM sheet_distributors WHERE pincode=%s", (pin,)))
+    if len(out) < 5:
+        add(qry("SELECT pincode,details FROM sheet_distributors WHERE pincode LIKE %s", (pin[:5]+"%",)))
+    if len(out) < 5:
+        add(qry("SELECT pincode,details FROM sheet_distributors WHERE pincode LIKE %s", (pin[:4]+"%",)))
+    if len(out) < 5:
+        add(qry("SELECT pincode,details FROM sheet_distributors WHERE pincode LIKE %s", (pin[:3]+"%",)))
+
+    if not out:
+        return [], "none"
+    last = out[-1]["pincode"]
+    lvl  = "exact" if last == pin else ("nearby" if last[:4] == pin[:4] else "district")
+    return out, lvl
+
+
+def fmt_sheet(rows, lvl):
+    """Number the sheet's Hindi text blocks into one WhatsApp message."""
+    L = {"exact": "आपके क्षेत्र के", "nearby": "आपके नजदीक के", "district": "आपके जिले के"}
+    parts = ["✅ " + L.get(lvl, "नजदीकी") + " *Neev Seeds* के " + str(len(rows)) + " डिस्ट्रीब्यूटर:"]
+    for i, r in enumerate(rows, 1):
+        parts.append("*" + str(i) + ".* " + r["details"].strip())
+    parts.append("किसी भी जानकारी के लिए डिस्ट्रीब्यूटर से सीधे संपर्क करें। 🙏")
+    return "\n\n".join(parts)
+
 
 # ---- CASCADING MATCH: 6 -> 5 -> 4 -> 3 digits, fill up to 5 ----
 def nearest(pin):
@@ -134,13 +164,13 @@ def find():
     try:
         m,lvl=nearest(pin)
         if not m: return jsonify({"count":0,"match_level":"none","distributors":[],"message":"पिनकोड "+pin+" के पास कोई डिस्ट्रीब्यूटर नहीं मिला। Neev Seeds से सीधे संपर्क करें। 🙏"})
-        sheet_txt, sheet_lvl = sheet_details(pin)
+        srows, slvl = sheet_nearest(pin)
         return jsonify({
-            "count": len(m),
-            "match_level": lvl,
-            "source": "sheet" if sheet_txt else "database",
+            "count": len(srows) if srows else len(m),
+            "match_level": slvl if srows else lvl,
+            "source": "sheet" if srows else "database",
             "distributors": [{"Distributor Name":d["name"],"Address":d["address"],"Mobile Number":d["mobile"]} for d in m],
-            "message": sheet_txt if sheet_txt else fmt(m, lvl)
+            "message": fmt_sheet(srows, slvl) if srows else fmt(m, lvl)
         })
     except Exception as e:
         logging.error("find: %s",e)
@@ -235,61 +265,69 @@ def del_d(rid):
 
 
 # ---- SHEET SYNC ENDPOINTS ----
-@app.route("/admin/pincode-details", methods=["GET"])
+@app.route("/admin/sheet", methods=["GET"])
 @auth
-def pd_list():
-    rows = qry("SELECT pincode,details,updated_at FROM pincode_details ORDER BY pincode")
-    for r in rows:
-        if r.get("updated_at"): r["updated_at"] = str(r["updated_at"])
-    return jsonify(rows)
+def sheet_list():
+    rows = qry("SELECT pincode, COUNT(*) as n FROM sheet_distributors GROUP BY pincode ORDER BY pincode")
+    total = one("SELECT COUNT(*) as c FROM sheet_distributors")["c"]
+    return jsonify({"total_rows": total, "unique_pincodes": len(rows), "pincodes": rows})
 
-@app.route("/admin/pincode-details", methods=["POST"])
+@app.route("/admin/sheet/clear", methods=["POST"])
 @auth
-def pd_upsert():
-    """Bulk upsert from the Google Sheet.
-       Body: {"rows":[{"pincode":"152116","details":"..."}], "replace_all":false}"""
+def sheet_clear():
+    run("DELETE FROM sheet_distributors")
+    return jsonify({"message": "cleared", "total_rows": 0})
+
+@app.route("/admin/sheet", methods=["POST"])
+@auth
+def sheet_upsert():
+    """Bulk insert from the Google Sheet - ONE ROW PER DISTRIBUTOR.
+       Body: {"rows":[{"pincode":"152116","details":"..."}]}
+       Uses a single multi-VALUES INSERT so 300 rows = 1 round trip."""
     body = request.get_json(silent=True) or {}
     rows = body.get("rows", [])
     if not isinstance(rows, list):
         return jsonify({"error": "rows must be a list"}), 400
 
+    clean   = []
+    skipped = []
+    for i, r in enumerate(rows):
+        pin = re.sub(r"\D", "", str(r.get("pincode", "")))
+        det = str(r.get("details", "")).strip()
+        if len(pin) != 6:
+            skipped.append({"index": i, "reason": "pincode not 6 digits"}); continue
+        if not det:
+            skipped.append({"index": i, "reason": "details empty"}); continue
+        clean.append((pin, det))
+
+    if not clean:
+        return jsonify({"saved": 0, "skipped": len(skipped),
+                        "skipped_detail": skipped[:20], "total_rows": 0})
+
     c = conn()
     try:
         cur = c.cursor()
-        if body.get("replace_all"):
-            cur.execute("DELETE FROM pincode_details")
-
-        saved = 0
-        skipped = []
-        for i, r in enumerate(rows):
-            pin = re.sub(r"\D", "", str(r.get("pincode", "")))
-            det = str(r.get("details", "")).strip()
-            if len(pin) != 6:
-                skipped.append({"index": i, "reason": "pincode not 6 digits"}); continue
-            if not det:
-                skipped.append({"index": i, "reason": "details empty"}); continue
-            cur.execute("""INSERT INTO pincode_details(pincode,details,updated_at)
-                           VALUES(%s,%s,NOW())
-                           ON CONFLICT (pincode)
-                           DO UPDATE SET details=EXCLUDED.details, updated_at=NOW()""",
-                        (pin, det))
-            saved += 1
-
-        cur.execute("SELECT COUNT(*) FROM pincode_details")
+        # Single bulk INSERT - one network round trip instead of N
+        placeholders = ",".join(["(%s,%s,NOW())"] * len(clean))
+        params = []
+        for pin, det in clean:
+            params.append(pin); params.append(det)
+        cur.execute(
+            "INSERT INTO sheet_distributors(pincode,details,updated_at) VALUES " + placeholders,
+            params)
+        cur.execute("SELECT COUNT(*) FROM sheet_distributors")
         total = cur.fetchone()[0]
+    except Exception as e:
+        logging.error("sheet_upsert: %s", e)
+        try: c.close()
+        except Exception: pass
+        return jsonify({"error": str(e)[:200]}), 500
     finally:
-        c.close()
+        try: c.close()
+        except Exception: pass
 
-    return jsonify({"saved": saved, "skipped": len(skipped),
-                    "skipped_detail": skipped[:20], "total_in_db": total})
-
-@app.route("/admin/pincode-details/<pin>", methods=["DELETE"])
-@auth
-def pd_delete(pin):
-    p = re.sub(r"\D", "", str(pin))
-    if len(p) != 6: return jsonify({"error": "Pincode must be 6 digits"}), 400
-    run("DELETE FROM pincode_details WHERE pincode=%s", (p,))
-    return jsonify({"message": "Deleted"})
+    return jsonify({"saved": len(clean), "skipped": len(skipped),
+                    "skipped_detail": skipped[:20], "total_rows": total})
 
 @app.route("/admin")
 def admin_ui():
@@ -315,9 +353,9 @@ def wa_plain():
                         mimetype="text/plain; charset=utf-8")
     try:
         # 1) Sheet is master
-        txt, lvl = sheet_details(pin)
-        if txt:
-            return Response(txt, mimetype="text/plain; charset=utf-8")
+        srows, slvl = sheet_nearest(pin)
+        if srows:
+            return Response(fmt_sheet(srows, slvl), mimetype="text/plain; charset=utf-8")
         # 2) Fallback to structured table
         m, lvl = nearest(pin)
         if not m:
@@ -441,8 +479,8 @@ fetch(B+'/health').then(function(r){
   row('c1','Server responding','HTTP '+o.status,ok?'ok':'bad');mark(ok);
   row('c1','Database connection',ok?'connected':(o.d.message||'error').substring(0,40),ok?'ok':'bad');mark(ok);
   row('c1','Distributors loaded',(o.d.distributors||0)+' records',o.d.distributors>0?'ok':'bad');mark(o.d.distributors>0);
-  var sp=o.d.sheet_pincodes||0;
-  row('c1','Sheet PIN codes synced',sp+' records',sp>0?'ok':'warn',sp>0?'':'run Push from Google Sheet');
+  var sr=o.d.sheet_rows||0, sp=o.d.sheet_pincodes||0;
+  row('c1','Sheet rows synced',sr+' rows',sr>0?'ok':'warn',sp+' unique PINs');
 
   var chas=!!o.cors;
   row('c2','Access-Control-Allow-Origin',chas?o.cors:'MISSING - website will fail',chas?'ok':'bad');mark(chas);
@@ -490,9 +528,12 @@ def test_page():
 def health():
     try:
         c = one("SELECT COUNT(*) as c FROM distributors")["c"]
-        try:    s = one("SELECT COUNT(*) as c FROM pincode_details")["c"]
-        except Exception: s = 0
-        return jsonify({"status":"ok","distributors":c,"sheet_pincodes":s})
+        try:
+            s = one("SELECT COUNT(*) as c FROM sheet_distributors")["c"]
+            u = one("SELECT COUNT(DISTINCT pincode) as c FROM sheet_distributors")["c"]
+        except Exception:
+            s, u = 0, 0
+        return jsonify({"status":"ok","distributors":c,"sheet_rows":s,"sheet_pincodes":u})
     except Exception as e:
         return jsonify({"status":"db_error","message":str(e)}),500
 
