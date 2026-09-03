@@ -8,13 +8,12 @@ app=Flask(__name__)
 DATABASE_URL=os.environ.get("DATABASE_URL","")
 ADMIN_KEY=os.environ.get("ADMIN_KEY","neev2024admin")
 
-# CORS — adds headers to EVERY response
 @app.after_request
-def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"]="*"
-    response.headers["Access-Control-Allow-Methods"]="GET,POST,OPTIONS"
-    response.headers["Access-Control-Allow-Headers"]="Content-Type,X-Admin-Key"
-    return response
+def add_cors(r):
+    r.headers["Access-Control-Allow-Origin"]="*"
+    r.headers["Access-Control-Allow-Methods"]="GET,POST,OPTIONS"
+    r.headers["Access-Control-Allow-Headers"]="Content-Type,X-Admin-Key"
+    return r
 
 @app.route("/find",methods=["OPTIONS"])
 @app.route("/weather",methods=["OPTIONS"])
@@ -22,16 +21,15 @@ def add_cors(response):
 @app.route("/admin/distributors",methods=["OPTIONS"])
 def preflight(**k): return "",204
 
-def parse_url(url):
-    m=re.match(r"postgresql://([^:]+):([^@]+)@([^:/]+):(\d+)/(.+)",url)
+def parse_url(u):
+    m=re.match(r"postgresql://([^:]+):([^@]+)@([^:/]+):(\d+)/(.+)",u)
     if not m: raise ValueError("Bad DATABASE_URL")
     return dict(user=m[1],password=m[2],host=m[3],port=int(m[4]),database=m[5])
 
 def conn():
     p=parse_url(DATABASE_URL)
     c=pg8000.dbapi.connect(user=p["user"],password=p["password"],host=p["host"],port=p["port"],database=p["database"],ssl_context=True)
-    c.autocommit=True
-    return c
+    c.autocommit=True; return c
 
 def qry(sql,args=()):
     c=conn()
@@ -58,57 +56,46 @@ def init():
         cur.execute("SELECT COUNT(*) FROM distributors")
         n=cur.fetchone()[0]
         if n==0:
-            logging.info("Seeding...")
+            logging.info("Seeding %d",len(SEED))
             for d in SEED:
                 cur.execute("INSERT INTO distributors(name,pincode,mobile,address) VALUES(%s,%s,%s,%s)",(d["name"],d["pincode"],d["mobile"],d["address"]))
         else: logging.info("DB has %d records",n)
     finally: c.close()
 
+
 def auth(f):
     @wraps(f)
-    def d(*a,**k):
-        k2=request.headers.get("X-Admin-Key") or request.args.get("key","")
-        if k2!=ADMIN_KEY: return jsonify({"error":"Unauthorized"}),401
+    def dec(*a,**k):
+        key=request.headers.get("X-Admin-Key") or request.args.get("key","")
+        if key!=ADMIN_KEY: return jsonify({"error":"Unauthorized"}),401
         return f(*a,**k)
-    return d
+    return dec
 
+# ---- CASCADING MATCH: 6 -> 5 -> 4 -> 3 digits, fill up to 5 ----
 def nearest(pin):
-    pi=int(pin)
-    seen=set(); results=[]
-
-    def add(rows,n):
+    pi=int(pin); seen=set(); out=[]
+    def add(rows):
         rows=sorted(rows,key=lambda r:abs(int(r["pincode"])-pi))
         for r in rows:
-            if r["name"] not in seen and len(results)<n:
-                seen.add(r["name"]); results.append(r)
-
-    # Tier 1: exact 6-digit
-    add(qry("SELECT * FROM distributors WHERE pincode=%s",(pin,)),5)
-    # Tier 2: first 5 digits
-    if len(results)<5:
-        add(qry("SELECT * FROM distributors WHERE pincode LIKE %s AND pincode!=%s",(pin[:5]+"%",pin)),5)
-    # Tier 3: first 4 digits
-    if len(results)<5:
-        add(qry("SELECT * FROM distributors WHERE pincode LIKE %s",(pin[:4]+"%",)),5)
-    # Tier 4: first 3 digits
-    if len(results)<5:
-        add(qry("SELECT * FROM distributors WHERE pincode LIKE %s",(pin[:3]+"%",)),5)
-
-    if not results: return [],"none"
-    # Label = deepest tier used
-    last=results[-1]["pincode"]
+            if r["name"] not in seen and len(out)<5:
+                seen.add(r["name"]); out.append(r)
+    add(qry("SELECT * FROM distributors WHERE pincode=%s",(pin,)))
+    if len(out)<5: add(qry("SELECT * FROM distributors WHERE pincode LIKE %s",(pin[:5]+"%",)))
+    if len(out)<5: add(qry("SELECT * FROM distributors WHERE pincode LIKE %s",(pin[:4]+"%",)))
+    if len(out)<5: add(qry("SELECT * FROM distributors WHERE pincode LIKE %s",(pin[:3]+"%",)))
+    if not out: return [],"none"
+    last=out[-1]["pincode"]
     if last==pin: lvl="exact"
-    elif last[:5]==pin[:5]: lvl="nearby"
     elif last[:4]==pin[:4]: lvl="nearby"
     else: lvl="district"
-    return results[:5],lvl
+    return out[:5],lvl
 
 def fmt(m,lvl):
     L={"exact":"आपके क्षेत्र के","nearby":"आपके नजदीक के","district":"आपके जिले के"}
-    lines=["✅ "+L.get(lvl,"नजदीकी")+" *Neev Seeds* के "+str(len(m))+" डिस्ट्रीब्यूटर:\n"]
-    for i,d in enumerate(m,1): lines+=["*"+str(i)+". "+d["name"]+"*","📍 "+d["address"],"📞 "+d["mobile"],""]
-    lines.append("किसी भी जानकारी के लिए डिस्ट्रीब्यूटर से सीधे संपर्क करें। 🙏")
-    return "\n".join(lines)
+    ls=["✅ "+L.get(lvl,"नजदीकी")+" *Neev Seeds* के "+str(len(m))+" डिस्ट्रीब्यूटर:\n"]
+    for i,d in enumerate(m,1): ls+=["*"+str(i)+". "+d["name"]+"*","📍 "+d["address"],"📞 "+d["mobile"],""]
+    ls.append("किसी भी जानकारी के लिए डिस्ट्रीब्यूटर से सीधे संपर्क करें। 🙏")
+    return "\n".join(ls)
 
 def getpin():
     p=(request.get_json(silent=True) or {}).get("pincode","") if request.method=="POST" else request.args.get("pincode","")
@@ -121,7 +108,7 @@ def find():
     if not pin: return jsonify({"count":0,"distributors":[],"message":"कृपया सही 6 अंकों का पिनकोड भेजें।"}),400
     try:
         m,lvl=nearest(pin)
-        if not m: return jsonify({"count":0,"distributors":[],"message":"पिनकोड "+pin+" के पास कोई डिस्ट्रीब्यूटर नहीं मिला। Neev Seeds से सीधे संपर्क करें। 🙏"})
+        if not m: return jsonify({"count":0,"match_level":"none","distributors":[],"message":"पिनकोड "+pin+" के पास कोई डिस्ट्रीब्यूटर नहीं मिला। Neev Seeds से सीधे संपर्क करें। 🙏"})
         return jsonify({"count":len(m),"match_level":lvl,"distributors":[{"Distributor Name":d["name"],"Address":d["address"],"Mobile Number":d["mobile"]} for d in m],"message":fmt(m,lvl)})
     except Exception as e:
         logging.error("find: %s",e)
@@ -141,16 +128,16 @@ def weather():
     if not pin: return jsonify({"message":"कृपया सही 6 अंकों का पिनकोड भेजें।"}),400
     try:
         if pin not in _LL:
-            url="https://nominatim.openstreetmap.org/search?postalcode="+pin+"&country=India&format=json&limit=1"
-            req=urllib.request.Request(url,headers={"User-Agent":"NeevSeeds/1.0"})
-            with urllib.request.urlopen(req,timeout=10) as r: d=json.loads(r.read())
+            u="https://nominatim.openstreetmap.org/search?postalcode="+pin+"&country=India&format=json&limit=1"
+            rq=urllib.request.Request(u,headers={"User-Agent":"NeevSeeds/1.0"})
+            with urllib.request.urlopen(rq,timeout=10) as r: d=json.loads(r.read())
             if not d: return jsonify({"message":"लोकेशन नहीं मिली।"})
             _LL[pin]=(float(d[0]["lat"]),float(d[0]["lon"]),d[0].get("display_name",""))
         lat,lon,loc=_LL[pin]
-        url2=("https://api.open-meteo.com/v1/forecast?latitude="+str(lat)+"&longitude="+str(lon)+"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max&timezone=Asia/Kolkata&forecast_days=7")
-        with urllib.request.urlopen(url2,timeout=10) as r: da=json.loads(r.read())["daily"]
+        u2=("https://api.open-meteo.com/v1/forecast?latitude="+str(lat)+"&longitude="+str(lon)+"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max&timezone=Asia/Kolkata&forecast_days=7")
+        with urllib.request.urlopen(u2,timeout=10) as r: da=json.loads(r.read())["daily"]
         city=[p.strip() for p in loc.split(",")]; city=city[1] if len(city)>1 else city[0]
-        lines2=["*"+city+" - 7 दिन का मौसम* (पिन: "+pin+")\n"]
+        ls=["*"+city+" - 7 दिन का मौसम* (पिन: "+pin+")\n"]
         for i in range(7):
             dt=datetime.strptime(da["time"][i],"%Y-%m-%d")
             rm=da["precipitation_sum"][i] or 0; rp=da["precipitation_probability_max"][i] or 0
@@ -158,10 +145,10 @@ def weather():
             if rm>0: ln+="\n🌧 "+str(rm)+"mm ("+str(rp)+"%)"
             elif rp>20: ln+="\n🌧 संभव: "+str(rp)+"%"
             ln+="\n💨 "+str(da["wind_speed_10m_max"][i])+" km/h"
-            lines2.append(ln)
-            if i<6: lines2.append("—")
-        lines2.append("\n_Open-Meteo_")
-        return jsonify({"pincode":pin,"location":loc,"message":"\n".join(lines2)})
+            ls.append(ln)
+            if i<6: ls.append("—")
+        ls.append("\n_Open-Meteo_")
+        return jsonify({"pincode":pin,"location":loc,"message":"\n".join(ls)})
     except Exception as e:
         logging.error("weather: %s",e); return jsonify({"message":"मौसम जानकारी अभी उपलब्ध नहीं।"}),500
 
