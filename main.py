@@ -55,11 +55,18 @@ def init():
         cur=c.cursor()
         cur.execute("""CREATE TABLE IF NOT EXISTS distributors(id SERIAL PRIMARY KEY,name TEXT NOT NULL,pincode TEXT NOT NULL,mobile TEXT NOT NULL,address TEXT NOT NULL,updated_at TIMESTAMPTZ DEFAULT NOW())""")
         # Sheet-sourced table: ONE ROW PER DISTRIBUTOR.
-        # Many rows may share the same pincode - that is expected.
+        # Stores every column from the Google Sheet.
+        # Render only reads pincode + details_hi; the rest is archived
+        # so the full sheet can be rebuilt from Supabase if ever needed.
         cur.execute("""CREATE TABLE IF NOT EXISTS sheet_distributors(
-            id SERIAL PRIMARY KEY,
-            pincode TEXT NOT NULL,
-            details TEXT NOT NULL,
+            id         SERIAL PRIMARY KEY,
+            s_no       TEXT,
+            address    TEXT,
+            name       TEXT,
+            pincode    TEXT NOT NULL,
+            details_en TEXT,
+            details_hi TEXT NOT NULL,
+            details_pa TEXT,
             updated_at TIMESTAMPTZ DEFAULT NOW())""")
         cur.execute("""CREATE INDEX IF NOT EXISTS idx_sheet_pin
                        ON sheet_distributors(pincode)""")
@@ -96,18 +103,18 @@ def sheet_nearest(pin):
     def add(rows):
         rows = sorted(rows, key=lambda r: abs(int(r["pincode"]) - pi))
         for r in rows:
-            key = r["details"].strip()
+            key = (r["details_hi"] or "").strip()
             if key not in seen and len(out) < 5:
                 seen.add(key)
                 out.append(r)
 
-    add(qry("SELECT pincode,details FROM sheet_distributors WHERE pincode=%s", (pin,)))
+    add(qry("SELECT pincode,details_hi FROM sheet_distributors WHERE pincode=%s", (pin,)))
     if len(out) < 5:
-        add(qry("SELECT pincode,details FROM sheet_distributors WHERE pincode LIKE %s", (pin[:5]+"%",)))
+        add(qry("SELECT pincode,details_hi FROM sheet_distributors WHERE pincode LIKE %s", (pin[:5]+"%",)))
     if len(out) < 5:
-        add(qry("SELECT pincode,details FROM sheet_distributors WHERE pincode LIKE %s", (pin[:4]+"%",)))
+        add(qry("SELECT pincode,details_hi FROM sheet_distributors WHERE pincode LIKE %s", (pin[:4]+"%",)))
     if len(out) < 5:
-        add(qry("SELECT pincode,details FROM sheet_distributors WHERE pincode LIKE %s", (pin[:3]+"%",)))
+        add(qry("SELECT pincode,details_hi FROM sheet_distributors WHERE pincode LIKE %s", (pin[:3]+"%",)))
 
     if not out:
         return [], "none"
@@ -121,7 +128,7 @@ def fmt_sheet(rows, lvl):
     L = {"exact": "आपके क्षेत्र के", "nearby": "आपके नजदीक के", "district": "आपके जिले के"}
     parts = ["✅ " + L.get(lvl, "नजदीकी") + " *Neev Seeds* के " + str(len(rows)) + " डिस्ट्रीब्यूटर:"]
     for i, r in enumerate(rows, 1):
-        parts.append("*" + str(i) + ".* " + r["details"].strip())
+        parts.append("*" + str(i) + ".* " + (r["details_hi"] or "").strip())
     parts.append("किसी भी जानकारी के लिए डिस्ट्रीब्यूटर से सीधे संपर्क करें। 🙏")
     return "\n\n".join(parts)
 
@@ -265,12 +272,17 @@ def del_d(rid):
 
 
 # ---- SHEET SYNC ENDPOINTS ----
+SHEET_FIELDS = ["s_no","address","name","pincode","details_en","details_hi","details_pa"]
+
 @app.route("/admin/sheet", methods=["GET"])
 @auth
 def sheet_list():
-    rows = qry("SELECT pincode, COUNT(*) as n FROM sheet_distributors GROUP BY pincode ORDER BY pincode")
     total = one("SELECT COUNT(*) as c FROM sheet_distributors")["c"]
-    return jsonify({"total_rows": total, "unique_pincodes": len(rows), "pincodes": rows})
+    uniq  = one("SELECT COUNT(DISTINCT pincode) as c FROM sheet_distributors")["c"]
+    sample = qry("SELECT * FROM sheet_distributors ORDER BY id LIMIT 5")
+    for r in sample:
+        if r.get("updated_at"): r["updated_at"] = str(r["updated_at"])
+    return jsonify({"total_rows": total, "unique_pincodes": uniq, "sample": sample})
 
 @app.route("/admin/sheet/clear", methods=["POST"])
 @auth
@@ -282,23 +294,30 @@ def sheet_clear():
 @auth
 def sheet_upsert():
     """Bulk insert from the Google Sheet - ONE ROW PER DISTRIBUTOR.
-       Body: {"rows":[{"pincode":"152116","details":"..."}]}
-       Uses a single multi-VALUES INSERT so 300 rows = 1 round trip."""
+       Body: {"rows":[{s_no,address,name,pincode,details_en,details_hi,details_pa}]}
+       Only pincode and details_hi are required. One multi-VALUES INSERT."""
     body = request.get_json(silent=True) or {}
     rows = body.get("rows", [])
     if not isinstance(rows, list):
         return jsonify({"error": "rows must be a list"}), 400
 
-    clean   = []
-    skipped = []
+    clean, skipped = [], []
     for i, r in enumerate(rows):
         pin = re.sub(r"\D", "", str(r.get("pincode", "")))
-        det = str(r.get("details", "")).strip()
+        hi  = str(r.get("details_hi", "")).strip()
         if len(pin) != 6:
             skipped.append({"index": i, "reason": "pincode not 6 digits"}); continue
-        if not det:
-            skipped.append({"index": i, "reason": "details empty"}); continue
-        clean.append((pin, det))
+        if not hi:
+            skipped.append({"index": i, "reason": "Hindi details empty"}); continue
+        clean.append((
+            str(r.get("s_no", "")).strip()       or None,
+            str(r.get("address", "")).strip()    or None,
+            str(r.get("name", "")).strip()       or None,
+            pin,
+            str(r.get("details_en", "")).strip() or None,
+            hi,
+            str(r.get("details_pa", "")).strip() or None,
+        ))
 
     if not clean:
         return jsonify({"saved": 0, "skipped": len(skipped),
@@ -307,13 +326,12 @@ def sheet_upsert():
     c = conn()
     try:
         cur = c.cursor()
-        # Single bulk INSERT - one network round trip instead of N
-        placeholders = ",".join(["(%s,%s,NOW())"] * len(clean))
+        ph = ",".join(["(%s,%s,%s,%s,%s,%s,%s,NOW())"] * len(clean))
         params = []
-        for pin, det in clean:
-            params.append(pin); params.append(det)
+        for row in clean:
+            params.extend(row)
         cur.execute(
-            "INSERT INTO sheet_distributors(pincode,details,updated_at) VALUES " + placeholders,
+            "INSERT INTO sheet_distributors(" + ",".join(SHEET_FIELDS) + ",updated_at) VALUES " + ph,
             params)
         cur.execute("SELECT COUNT(*) FROM sheet_distributors")
         total = cur.fetchone()[0]
