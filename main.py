@@ -1,5 +1,5 @@
 from flask import Flask,request,jsonify,Response
-import urllib.request,json,logging,os,re,threading,time
+import urllib.request,json,logging,os,re
 from datetime import datetime
 from functools import wraps
 import pg8000.dbapi
@@ -190,57 +190,11 @@ def sheet_cards(rows):
     return out
 
 
-# ---- IN-MEMORY COPY OF sheet_distributors ----
-# Every qry() opens a fresh TLS connection to Supabase (~2 s from Render
-# Oregon), and one lookup used to run up to 4 queries, so /find took
-# 8-10 s. The table is small (~600 rows), so keep it in memory, reload it
-# every SHEET_CACHE_TTL seconds, and reload at once after a sheet push.
-_SHEET_CACHE = {"rows": None, "at": 0.0}
-_SHEET_LOCK = threading.Lock()
-SHEET_CACHE_TTL = int(os.environ.get("SHEET_CACHE_TTL", "600"))
-
-
-def sheet_rows(force=False):
-    """All sheet_distributors rows (pincode, details_hi, name, address)."""
-    if (not force and _SHEET_CACHE["rows"] is not None
-            and time.time() - _SHEET_CACHE["at"] < SHEET_CACHE_TTL):
-        return _SHEET_CACHE["rows"]
-    with _SHEET_LOCK:
-        if (not force and _SHEET_CACHE["rows"] is not None
-                and time.time() - _SHEET_CACHE["at"] < SHEET_CACHE_TTL):
-            return _SHEET_CACHE["rows"]
-        try:
-            rows = qry("SELECT pincode,details_hi,name,address FROM sheet_distributors ORDER BY id")
-            for r in rows:
-                r["pincode"] = str(r["pincode"] or "").strip()
-            _SHEET_CACHE["rows"] = rows
-            _SHEET_CACHE["at"] = time.time()
-            logging.info("sheet cache loaded: %d rows", len(rows))
-        except Exception as e:
-            logging.error("sheet cache reload failed: %s", e)
-            if _SHEET_CACHE["rows"] is None:
-                raise
-            # Keep serving the last good copy; try again in a minute.
-            _SHEET_CACHE["at"] = time.time() - SHEET_CACHE_TTL + 60
-        return _SHEET_CACHE["rows"]
-
-
-def reload_sheet_cache():
-    """Call after any write to sheet_distributors."""
-    try:
-        sheet_rows(force=True)
-    except Exception as e:
-        logging.error("sheet cache reload after write failed: %s", e)
-        _SHEET_CACHE["at"] = 0.0
-
-
 def sheet_nearest(pin):
-    """Return up to 5 distributor rows, nearest first.
-       Same 6 -> 5 -> 4 -> 3 digit cascade as before, run in memory."""
+    """Return up to 5 distributor rows, nearest first."""
     pi = int(pin)
     seen = set()
     out  = []
-    allrows = sheet_rows()
 
     def add(rows):
         rows = sorted(rows, key=lambda r: abs(int(r["pincode"]) - pi))
@@ -250,10 +204,13 @@ def sheet_nearest(pin):
                 seen.add(key)
                 out.append(r)
 
-    add([r for r in allrows if r["pincode"] == pin])
-    for n in (5, 4, 3):
-        if len(out) < 5:
-            add([r for r in allrows if r["pincode"].startswith(pin[:n])])
+    add(qry("SELECT pincode,details_hi,name,address FROM sheet_distributors WHERE pincode=%s", (pin,)))
+    if len(out) < 5:
+        add(qry("SELECT pincode,details_hi,name,address FROM sheet_distributors WHERE pincode LIKE %s", (pin[:5]+"%",)))
+    if len(out) < 5:
+        add(qry("SELECT pincode,details_hi,name,address FROM sheet_distributors WHERE pincode LIKE %s", (pin[:4]+"%",)))
+    if len(out) < 5:
+        add(qry("SELECT pincode,details_hi,name,address FROM sheet_distributors WHERE pincode LIKE %s", (pin[:3]+"%",)))
 
     if not out:
         return [], "none"
@@ -567,7 +524,6 @@ def sheet_commit():
         try: c.close()
         except Exception: pass
 
-    reload_sheet_cache()
     return jsonify({"committed": True, "live_rows": final,
                     "previous_rows": live, "staged": staged})
 
@@ -723,7 +679,6 @@ def sheet_reset():
     finally:
         try: c.close()
         except Exception: pass
-    reload_sheet_cache()
     return jsonify({"message": "tables rebuilt", "total_rows": 0})
 
 @app.route("/admin")
@@ -1017,17 +972,5 @@ SEED=[{"name": "Asia Agro Centre (Malout)", "pincode": "152107", "mobile": "9815
 
 try: init()
 except Exception as e: logging.error("Startup init: %s",e)
-
-# Load the sheet cache in the background so the first /find after a
-# restart does not wait for Supabase.
-threading.Thread(target=reload_sheet_cache, daemon=True).start()
-
-
-@app.route("/ping")
-def ping_public():
-    """Keep-alive check: no database call."""
-    return jsonify({"ok": True,
-                    "sheet_cache_rows": len(_SHEET_CACHE["rows"] or []),
-                    "sheet_cache_age_s": int(time.time() - _SHEET_CACHE["at"]) if _SHEET_CACHE["rows"] is not None else None})
 
 if __name__=="__main__": app.run(host="0.0.0.0",port=8080)
