@@ -1025,8 +1025,14 @@ threading.Thread(target=reload_sheet_cache, daemon=True).start()
 
 @app.route("/ping")
 def ping_public():
-    """Keep-alive check: no database call."""
-    return jsonify({"ok": True,
+    """Keep-alive check. Never waits on the database: if the sheet cache
+       is stale it is refreshed in a background thread, so the next
+       farmer's search is served from memory."""
+    stale = (_SHEET_CACHE["rows"] is None
+             or time.time() - _SHEET_CACHE["at"] >= SHEET_CACHE_TTL)
+    if stale and not _SHEET_LOCK.locked():
+        threading.Thread(target=reload_sheet_cache, daemon=True).start()
+    return jsonify({"ok": True, "refreshing": bool(stale),
                     "sheet_cache_rows": len(_SHEET_CACHE["rows"] or []),
                     "sheet_cache_age_s": int(time.time() - _SHEET_CACHE["at"]) if _SHEET_CACHE["rows"] is not None else None})
 
