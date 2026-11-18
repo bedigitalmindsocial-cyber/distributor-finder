@@ -1018,20 +1018,20 @@ SEED=[{"name": "Asia Agro Centre (Malout)", "pincode": "152107", "mobile": "9815
 try: init()
 except Exception as e: logging.error("Startup init: %s",e)
 
-# Load the sheet cache in the background so the first /find after a
-# restart does not wait for Supabase.
-threading.Thread(target=reload_sheet_cache, daemon=True).start()
+# No background threads: an earlier version warmed this cache from a
+# thread at startup and the first request after a deploy hung until
+# gunicorn killed the worker. The first /find (or /ping) loads it instead.
 
 
 @app.route("/ping")
 def ping_public():
-    """Keep-alive check. Never waits on the database: if the sheet cache
-       is stale it is refreshed in a background thread, so the next
-       farmer's search is served from memory."""
+    """Keep-alive check, hit every 10 min by a scheduled pinger. If the
+       sheet cache is stale it is reloaded here (one query, ~2 s), so the
+       pinger waits instead of the next farmer."""
     stale = (_SHEET_CACHE["rows"] is None
              or time.time() - _SHEET_CACHE["at"] >= SHEET_CACHE_TTL)
-    if stale and not _SHEET_LOCK.locked():
-        threading.Thread(target=reload_sheet_cache, daemon=True).start()
+    if stale:
+        reload_sheet_cache()
     return jsonify({"ok": True, "refreshing": bool(stale),
                     "sheet_cache_rows": len(_SHEET_CACHE["rows"] or []),
                     "sheet_cache_age_s": int(time.time() - _SHEET_CACHE["at"]) if _SHEET_CACHE["rows"] is not None else None})
